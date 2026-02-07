@@ -25,6 +25,7 @@ pulseaudio-backend = ["dep:libpulse-binding", "dep:libpulse-simple-binding"]
 rodio-backend = ["dep:cpal", "dep:rodio"]
 rodiojack-backend = ["dep:rodio", "cpal/jack"]
 sdl-backend = ["dep:sdl2"]
+uwp-backend = []
 
 # Audio processing features
 passthrough-decoder = ["dep:ogg"]
@@ -100,3 +101,4 @@ form_urlencoded = "1.2.2"
 
 [lints]
 workspace = true
+

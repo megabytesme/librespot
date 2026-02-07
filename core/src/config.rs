@@ -18,7 +18,7 @@ pub const OS: &str = std::env::consts::OS;
 // 'ios': 17
 /// See [sysinfo::System::os_version]
 pub fn os_version() -> String {
-    sysinfo::System::os_version().unwrap_or("0".into())
+    "Windows UWP".to_string()
 }
 
 #[derive(Clone, Debug)]

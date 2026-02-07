@@ -91,6 +91,9 @@ portaudio-backend = ["librespot-playback/portaudio-backend"]
 # sdl-backend: Simple DirectMedia Layer audio backend.
 sdl-backend = ["librespot-playback/sdl-backend"]
 
+# uwp-backend: Windows Universal Platform audio backend (FFI).
+uwp-backend = ["librespot-playback/uwp-backend"]
+
 # Platform-specific backends:
 
 # alsa-backend: Advanced Linux Sound Architecture backend (Linux only).
@@ -135,11 +138,7 @@ passthrough-decoder = ["librespot-playback/passthrough-decoder"]
 [lib]
 name = "librespot"
 path = "src/lib.rs"
-
-[[bin]]
-name = "librespot"
-path = "src/main.rs"
-doc = false
+crate-type = ["cdylib"]
 
 [workspace.dependencies]
 librespot-audio = { version = "0.8.0", path = "audio", default-features = false }
@@ -171,7 +170,6 @@ futures-util = { version = "0.3", default-features = false }
 getopts = "0.2"
 log = "0.4"
 sha1 = "0.10"
-sysinfo = { version = "0.36", default-features = false, features = ["system"] }
 thiserror = "2"
 tokio = { version = "1", features = [
     "rt",
@@ -181,6 +179,7 @@ tokio = { version = "1", features = [
     "process",
 ] }
 url = "2.2"
+hex = "0.4"
 
 [package.metadata.deb]
 maintainer = "Librespot Organization <noreply@github.com>"
@@ -215,3 +214,4 @@ clippy.redundant_closure_for_method_calls = "warn"
 
 [lints]
 workspace = true
+

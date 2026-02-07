@@ -115,6 +115,11 @@ mod sdl;
 #[cfg(feature = "sdl-backend")]
 use self::sdl::SdlSink;
 
+#[cfg(feature = "uwp-backend")]
+mod uwp;
+#[cfg(feature = "uwp-backend")]
+use self::uwp::UwpSink;
+
 mod pipe;
 use self::pipe::StdoutSink;
 
@@ -138,6 +143,8 @@ pub const BACKENDS: &[(&str, SinkBuilder)] = &[
     ("rodiojack", rodio::mk_rodiojack),
     #[cfg(feature = "sdl-backend")]
     (SdlSink::NAME, mk_sink::<SdlSink>),
+    #[cfg(feature = "uwp-backend")]
+    (UwpSink::NAME, mk_sink::<UwpSink>),
     (StdoutSink::NAME, mk_sink::<StdoutSink>),
     (SubprocessSink::NAME, mk_sink::<SubprocessSink>),
 ];

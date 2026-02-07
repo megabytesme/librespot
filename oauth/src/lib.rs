@@ -248,7 +248,7 @@ impl OAuthClient {
             .url();
 
         if self.should_open_url {
-            open::that_in_background(auth_url.as_str());
+            log::info!("Please open this URL manually: {}", auth_url.as_str());
         }
         println!("Browse to: {auth_url}");
 

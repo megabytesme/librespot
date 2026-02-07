@@ -25,7 +25,7 @@ bytes = "1"
 ctr = "0.9"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 http-body-util = "0.1"
-hyper = { version = "1.6", features = ["http1", "http2"] }
+hyper = { version = "1.0", features = ["http1", "http2"] }
 hyper-util = { version = "0.1", features = ["client", "http2"] }
 log = "0.4"
 tempfile = "3"

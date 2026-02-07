@@ -35,7 +35,7 @@ futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 hmac = "0.12"
 http-body-util = "0.1"
-hyper = { version = "1.6", features = ["http1"] }
+hyper = { version = "1.0", features = ["http1"] }
 hyper-util = { version = "0.1", features = [
     "server-auto",
     "server-graceful",
