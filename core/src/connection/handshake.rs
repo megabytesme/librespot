@@ -138,9 +138,9 @@ where
             _ => Platform::PLATFORM_OSX_X86,
         },
         "windows" => match ARCH {
-            "arm" | "aarch64" => Platform::PLATFORM_WINDOWS_CE_ARM,
-            "x86_64" => Platform::PLATFORM_WIN32_X86_64,
-            _ => Platform::PLATFORM_WIN32_X86,
+            "arm" | "aarch64" => Platform::PLATFORM_WINRT_ARM,
+            "x86_64" => Platform::PLATFORM_WINRT_X86_64,
+            _ => Platform::PLATFORM_WINRT_X86,
         },
         _ => Platform::PLATFORM_LINUX_X86,
     };
