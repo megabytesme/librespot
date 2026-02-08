@@ -2,7 +2,7 @@ use crate::ffi_types::*;
 use futures_util::StreamExt;
 use librespot_connect::{ConnectConfig, Spirc};
 use librespot_core::{
-    Session, SessionConfig, SpotifyId, SpotifyUri, authentication::Credentials, cache::Cache,
+    Session, SessionConfig, SpotifyUri, authentication::Credentials, cache::Cache,
     config::DeviceType,
 };
 use librespot_discovery::Discovery;
@@ -13,7 +13,6 @@ use librespot_playback::{
 };
 use std::ffi::{CString, c_void};
 use std::pin::Pin;
-use std::str::FromStr;
 use tokio::sync::mpsc;
 
 pub enum LibrespotCommand {
@@ -57,6 +56,20 @@ impl Runner {
         callback: LibrespotCallback,
         user_data: *mut c_void,
     ) -> Self {
+        log::info!("Runner::new()");
+        log::info!("  device_name={}", setup.device_name);
+        log::info!("  device_type={:?}", setup.device_type);
+        log::info!("  enable_discovery={}", setup.enable_discovery);
+        log::info!("  audio_format={:?}", setup.audio_format);
+        log::info!("  player.bitrate={:?}", setup.player_config.bitrate);
+        log::info!(
+            "  player.normalisation={}",
+            setup.player_config.normalisation
+        );
+        log::info!("  mixer.volume_ctrl={:?}", setup.mixer_config.volume_ctrl);
+        log::info!("  tmp_dir={:?}", setup.session_config.tmp_dir);
+        log::info!("  initial_creds={}", setup.initial_creds.is_some());
+
         Self {
             setup,
             cmd_rx,
@@ -70,6 +83,8 @@ impl Runner {
     }
 
     pub async fn run(&mut self) {
+        log::info!("Runner::run() starting");
+
         let cache = Cache::new(
             Some(self.setup.session_config.tmp_dir.clone()),
             Some(self.setup.session_config.tmp_dir.clone()),
@@ -78,12 +93,20 @@ impl Runner {
         )
         .ok();
 
+        log::info!("Cache initialised");
+
         let mut session = Session::new(self.setup.session_config.clone(), cache.clone());
+        log::info!("Session created");
 
         let mixer_builder = mixer::find(None).expect("No mixer found");
         let mixer = mixer_builder(self.setup.mixer_config.clone()).expect("Failed to create mixer");
+        log::info!("Mixer created");
+
         let backend = self.setup.audio_backend;
+        log::info!("Audio backend resolved");
+
         let format = self.setup.audio_format;
+        log::info!("Audio format for backend: {:?}", format);
 
         let player = Player::new(
             self.setup.player_config.clone(),
@@ -92,13 +115,15 @@ impl Runner {
             move || (backend)(None, format),
         );
 
+        log::info!("Player created");
+
         let mut spirc: Option<Spirc> = None;
-        // Explicit type annotation for the task handle
         let mut spirc_task: Option<Pin<Box<dyn std::future::Future<Output = ()> + Send>>> = None;
         let mut discovery: Option<Discovery> = None;
         let mut player_rx = player.get_player_event_channel();
 
         if self.setup.enable_discovery {
+            log::info!("Starting discovery service");
             discovery = Discovery::builder(
                 self.setup.session_config.device_id.clone(),
                 self.setup.session_config.client_id.clone(),
@@ -113,116 +138,141 @@ impl Runner {
         let mut last_creds = self.setup.initial_creds.clone();
         let mut connecting = last_creds.is_some();
 
+        log::info!("Runner main loop starting");
+
         loop {
             tokio::select! {
-            Some(cmd) = self.cmd_rx.recv() => {
-                match cmd {
-                    LibrespotCommand::Stop => player.stop(),
-                    LibrespotCommand::Play => player.play(),
-                    LibrespotCommand::Pause => player.pause(),
-
-                    // Route through Spirc (the Connect controller) for playlist logic
-                    LibrespotCommand::Next => {
-                        if let Some(ref s) = spirc { s.next(); }
-                    },
-                    LibrespotCommand::Prev => {
-                        if let Some(ref s) = spirc { s.prev(); }
-                    },
-
-                    // Use the mixer directly for volume
-                    LibrespotCommand::SetVolume(v) => {
-                        mixer.set_volume(v);
-                        // Also notify the player so it can emit events to other controllers
-                        player.emit_volume_changed_event(v);
-                    },
-
-                    LibrespotCommand::Seek(ms) => player.seek(ms),
-
-                    LibrespotCommand::Load { uri, play } => {
-                        // Correct conversion to SpotifyUri for this version of the player
-                        if let Ok(track_uri) = SpotifyUri::from_uri(&uri) {
-                            player.load(track_uri, play, 0);
+                Some(cmd) = self.cmd_rx.recv() => {
+                    match cmd {
+                        LibrespotCommand::Stop => {
+                            log::info!("Command: Stop");
+                            player.stop();
                         }
-                    }
-
-                    LibrespotCommand::StartDiscovery => {
-                        if discovery.is_none() {
-                            discovery = Discovery::builder(self.setup.session_config.device_id.clone(), self.setup.session_config.client_id.clone())
+                        LibrespotCommand::Play => {
+                            log::info!("Command: Play");
+                            player.play();
+                        }
+                        LibrespotCommand::Pause => {
+                            log::info!("Command: Pause");
+                            player.pause();
+                        }
+                        LibrespotCommand::Next => {
+                            log::info!("Command: Next");
+                            if let Some(ref s) = spirc { s.next(); }
+                        }
+                        LibrespotCommand::Prev => {
+                            log::info!("Command: Prev");
+                            if let Some(ref s) = spirc { s.prev(); }
+                        }
+                        LibrespotCommand::SetVolume(v) => {
+                            log::info!("Command: SetVolume({})", v);
+                            mixer.set_volume(v);
+                            player.emit_volume_changed_event(v);
+                        }
+                        LibrespotCommand::Seek(ms) => {
+                            log::info!("Command: Seek({})", ms);
+                            player.seek(ms);
+                        }
+                        LibrespotCommand::Load { uri, play } => {
+                            log::info!("Command: Load(uri={}, play={})", uri, play);
+                            if let Ok(track_uri) = SpotifyUri::from_uri(&uri) {
+                                player.load(track_uri, play, 0);
+                            } else {
+                                log::warn!("Invalid Spotify URI: {}", uri);
+                            }
+                        }
+                        LibrespotCommand::StartDiscovery => {
+                            log::info!("Command: StartDiscovery");
+                            if discovery.is_none() {
+                                discovery = Discovery::builder(
+                                    self.setup.session_config.device_id.clone(),
+                                    self.setup.session_config.client_id.clone(),
+                                )
                                 .name(self.setup.device_name.clone())
                                 .device_type(self.setup.device_type)
                                 .launch()
                                 .ok();
+                            }
                         }
-                    },
+                        LibrespotCommand::UpdateCredentials { username, auth_data } => {
+                            log::info!("Command: UpdateCredentials(user={})", username);
+                            last_creds = Some(Credentials::with_password(username, auth_data));
+                            connecting = true;
+                        }
+                    }
+                }
 
-                    LibrespotCommand::UpdateCredentials { username, auth_data } => {
-                        last_creds = Some(Credentials::with_password(username, auth_data));
+                Some(event) = player_rx.recv() => {
+                    log::info!("PlayerEvent received: {:?}", event);
+                    self.handle_player_event(event);
+                }
+
+                creds_opt = async {
+                    match discovery.as_mut() {
+                        Some(d) => d.next().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(creds) = creds_opt {
+                        log::info!("Discovery provided credentials");
+                        last_creds = Some(creds);
                         connecting = true;
                     }
                 }
-            }
-                        Some(event) = player_rx.recv() => {
-                            self.handle_player_event(event);
+
+                _ = async {}, if connecting && last_creds.is_some() => {
+                    log::info!("Connecting with new credentials");
+
+                    if session.is_invalid() {
+                        log::info!("Session invalid, recreating");
+                        session = Session::new(self.setup.session_config.clone(), cache.clone());
+                        player.set_session(session.clone());
+                    }
+
+                    if let Some(c) = last_creds.clone() {
+                        if let Some(s) = spirc.take() {
+                            log::info!("Shutting down old Spirc");
+                            let _ = s.shutdown();
                         }
 
-                        // Explicit match for discovery future
-                        creds_opt = async {
-                             match discovery.as_mut() {
-                                 Some(d) => d.next().await,
-                                 None => std::future::pending().await,
-                             }
-                        } => {
-                            if let Some(creds) = creds_opt {
-                                last_creds = Some(creds);
-                                connecting = true;
+                        let spirc_res = Spirc::new(
+                            self.setup.connect_config.clone(),
+                            session.clone(),
+                            c,
+                            player.clone(),
+                            mixer.clone()
+                        ).await;
+
+                        match spirc_res {
+                            Ok((s, task)) => {
+                                log::info!("Spirc connected");
+                                spirc = Some(s);
+                                spirc_task = Some(Box::pin(task));
+                                self.emit(LibrespotEvent {
+                                    event_type: EventType::SessionConnected,
+                                    data: unsafe { std::mem::zeroed() }
+                                });
+                                connecting = false;
                             }
-                        }
-
-                        _ = async {}, if connecting && last_creds.is_some() => {
-                            if session.is_invalid() {
-                                session = Session::new(self.setup.session_config.clone(), cache.clone());
-                                player.set_session(session.clone());
+                            Err(e) => {
+                                log::error!("Spirc connection failed: {:?}", e);
                             }
-
-                            if let Some(c) = last_creds.clone() {
-                                if let Some(s) = spirc.take() {
-                                    let _ = s.shutdown();
-                                }
-
-                                // Fix explicit type inference for tuple return
-                                let spirc_res = Spirc::new(
-                                    self.setup.connect_config.clone(),
-                                    session.clone(),
-                                    c,
-                                    player.clone(),
-                                    mixer.clone()
-                                ).await;
-
-                                if let Ok((s, task)) = spirc_res {
-                                    spirc = Some(s);
-                                    // Explicitly box and pin the opaque future returned by librespot
-                                    spirc_task = Some(Box::pin(task));
-
-                                    self.emit(LibrespotEvent {
-                                        event_type: EventType::SessionConnected,
-                                        data: unsafe { std::mem::zeroed() }
-                                    });
-                                    connecting = false;
-                                }
-                            }
-                        }
-
-                        _ = async {
-                            if let Some(t) = spirc_task.as_mut() { t.await; }
-                        }, if spirc_task.is_some() => {
-                            spirc_task = None;
-                            spirc = None;
-                            self.emit(LibrespotEvent {
-                                event_type: EventType::SessionDisconnected,
-                                data: unsafe { std::mem::zeroed() }
-                            });
                         }
                     }
+                }
+
+                _ = async {
+                    if let Some(t) = spirc_task.as_mut() { t.await; }
+                }, if spirc_task.is_some() => {
+                    log::warn!("Spirc task ended");
+                    spirc_task = None;
+                    spirc = None;
+                    self.emit(LibrespotEvent {
+                        event_type: EventType::SessionDisconnected,
+                        data: unsafe { std::mem::zeroed() }
+                    });
+                }
+            }
         }
     }
 

@@ -1,21 +1,6 @@
 use std::ffi::{c_char, c_void};
 
 #[repr(C)]
-pub enum AudioFormat {
-    F32,
-    S16,
-    S24,
-    S32,
-}
-
-#[repr(C)]
-pub enum Bitrate {
-    B96 = 96,
-    B160 = 160,
-    B320 = 320,
-}
-
-#[repr(C)]
 pub struct LibrespotConfig {
     pub device_name: *const c_char,
     pub device_type: *const c_char,
@@ -28,6 +13,25 @@ pub struct LibrespotConfig {
     pub password: *const c_char,
     pub auth_blob: *const c_char,
     pub access_token: *const c_char,
+}
+
+#[repr(i32)]
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum Bitrate {
+    B96 = 96,
+    B160 = 160,
+    B320 = 320,
+}
+
+#[repr(i32)]
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum AudioFormat {
+    F64 = 0,
+    F32 = 1,
+    S32 = 2,
+    S24 = 3,
+    S24_3 = 4,
+    S16 = 5,
 }
 
 #[repr(C)]
