@@ -1,7 +1,15 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use crate::config::AudioFormat;
 use crate::convert::Converter;
 use crate::decoder::AudioPacket;
 use thiserror::Error;
+
+static TOTAL_WRITTEN: AtomicUsize = AtomicUsize::new(0);
+
+pub fn get_write_pos() -> usize {
+    TOTAL_WRITTEN.load(Ordering::Acquire)
+}
 
 #[derive(Debug, Error)]
 pub enum SinkError {

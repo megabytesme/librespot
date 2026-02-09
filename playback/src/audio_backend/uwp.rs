@@ -71,6 +71,7 @@ impl Sink for UwpSink {
 
 impl SinkAsBytes for UwpSink {
     fn write_bytes(&mut self, data: &[u8]) -> SinkResult<()> {
+        let len = data.len();
         unsafe {
             if AUDIO_BUFFER.is_null() {
                 return Err(SinkError::NotConnected("Buffer not allocated".into()));
@@ -110,6 +111,7 @@ impl SinkAsBytes for UwpSink {
             let new_wp = (wp + len) % cap;
             WRITE_POS.store(new_wp, Ordering::Release);
         }
+        super::TOTAL_WRITTEN.fetch_add(len, Ordering::SeqCst);
         Ok(())
     }
 }
