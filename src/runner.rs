@@ -11,13 +11,15 @@ use librespot_playback::{
     mixer::{self, MixerConfig},
     player::{Player, PlayerEvent},
 };
-use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use std::sync::{Arc, atomic::AtomicU8};
 use std::{ffi::CString, sync::atomic::AtomicUsize};
+use std::{mem::ManuallyDrop, pin::Pin};
 use tokio::sync::mpsc;
 
+#[derive(Debug)]
+#[allow(dead_code)]
 pub enum LibrespotCommand {
     Load { uri: String, play: bool },
     Play,
@@ -66,10 +68,21 @@ pub struct RunnerState {
     pub duration_ms: AtomicU32,
     pub volume: AtomicU16,
     pub current_track: RwLock<Option<TrackMetadataInternal>>,
+    pub sample_rate: AtomicU32,
+    pub bytes_per_sample: AtomicU8,
 }
 
 impl RunnerState {
-    pub fn new() -> Self {
+    pub fn new(format: librespot_playback::config::AudioFormat, sample_rate: u32) -> Self {
+        let bytes = match format {
+            librespot_playback::config::AudioFormat::F64 => 8,
+            librespot_playback::config::AudioFormat::F32 => 4,
+            librespot_playback::config::AudioFormat::S32 => 4,
+            librespot_playback::config::AudioFormat::S24 => 4,
+            librespot_playback::config::AudioFormat::S24_3 => 3,
+            librespot_playback::config::AudioFormat::S16 => 2,
+        };
+
         Self {
             is_playing: AtomicBool::new(false),
             shuffle: AtomicBool::new(false),
@@ -79,6 +92,8 @@ impl RunnerState {
             duration_ms: AtomicU32::new(0),
             volume: AtomicU16::new(0),
             current_track: RwLock::new(None),
+            sample_rate: AtomicU32::new(sample_rate),
+            bytes_per_sample: AtomicU8::new(bytes),
         }
     }
 }
@@ -97,13 +112,14 @@ impl Runner {
         cmd_rx: mpsc::UnboundedReceiver<LibrespotCommand>,
         callback: LibrespotCallback,
         user_data: UserDataWrapper,
+        state: Arc<RunnerState>,
     ) -> Self {
         Self {
             setup,
             cmd_rx,
             callback,
             user_data,
-            state: Arc::new(RunnerState::new()),
+            state,
         }
     }
 

@@ -41,7 +41,7 @@ pub unsafe extern "C" fn librespot_new(
 
     let (tx, rx) = mpsc::unbounded_channel();
 
-    let runner_state = Arc::new(RunnerState::new());
+    let runner_state = Arc::new(RunnerState::new(setup.audio_format, 44100));
     let state_for_thread = runner_state.clone();
 
     let user_data_wrapper = UserDataWrapper(user_data);
@@ -50,8 +50,7 @@ pub unsafe extern "C" fn librespot_new(
         let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
 
         rt.block_on(async move {
-            let mut runner = Runner::new(setup, rx, callback, user_data_wrapper);
-            runner.state = state_for_thread;
+            let mut runner = Runner::new(setup, rx, callback, user_data_wrapper, state_for_thread);
             runner.run().await;
         });
     });
@@ -101,6 +100,11 @@ pub unsafe extern "C" fn librespot_pause(instance: *mut LibrespotInstance) {
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn librespot_stop(instance: *mut LibrespotInstance) {
+    unsafe { send_cmd(instance, LibrespotCommand::Stop) };
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn librespot_next(instance: *mut LibrespotInstance) {
     unsafe { send_cmd(instance, LibrespotCommand::Next) };
 }
@@ -143,14 +147,17 @@ pub unsafe extern "C" fn librespot_get_position_ms(instance: *mut LibrespotInsta
 
         let current_wp = librespot_playback::audio_backend::get_write_pos();
 
-        if current_wp < sync_wp {
+        if current_wp <= sync_wp {
             return base_ms;
         }
+
         let bytes_delta = current_wp - sync_wp;
 
-        let sample_rate = 44100.0;
+        let sample_rate = state.sample_rate.load(Ordering::Acquire) as f32;
+        let bytes_per_sample = state.bytes_per_sample.load(Ordering::Acquire) as f32;
         let channels = 2.0;
-        let bytes_per_ms = (sample_rate * channels * 2.0) / 1000.0;
+
+        let bytes_per_ms = (sample_rate * channels * bytes_per_sample) / 1000.0;
 
         if bytes_per_ms <= 0.0 {
             return base_ms;
