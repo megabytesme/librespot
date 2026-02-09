@@ -2,11 +2,6 @@ use crate::ffi_types::{EventData, EventType, LibrespotCallback, LibrespotEvent};
 use log::{Level, Metadata, Record, SetLoggerError};
 use std::ffi::{CString, c_void};
 
-struct CbLogger {
-    callback: LibrespotCallback,
-    user_data: *mut c_void,
-}
-
 static mut GLOBAL_CB: Option<LibrespotCallback> = None;
 static mut GLOBAL_CTX: *mut c_void = std::ptr::null_mut();
 
@@ -23,11 +18,13 @@ impl log::Log for SimpleLogger {
                 if let Some(cb) = GLOBAL_CB {
                     let msg = format!("{} - {}", record.level(), record.args());
                     let c_msg = CString::new(msg).unwrap();
+
+                    let mut data: EventData = std::mem::zeroed();
+                    data.log_msg = c_msg.as_ptr();
+
                     let evt = LibrespotEvent {
                         event_type: EventType::LogMessage,
-                        data: EventData {
-                            log_msg: c_msg.as_ptr(),
-                        },
+                        data,
                     };
                     cb(&evt, GLOBAL_CTX);
                 }

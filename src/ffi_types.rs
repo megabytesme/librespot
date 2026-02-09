@@ -1,4 +1,7 @@
-use std::ffi::{c_char, c_void};
+use std::{
+    ffi::{c_char, c_void},
+    mem::ManuallyDrop,
+};
 
 #[repr(C)]
 pub struct LibrespotConfig {
@@ -46,6 +49,21 @@ pub enum EventType {
     PlaybackStopped = 7,
     VolumeChanged = 8,
     Panic = 9,
+    ShuffleChanged = 10,
+    RepeatChanged = 11,
+    AutoPlayChanged = 12,
+    Seeked = 13,
+    PositionCorrection = 14,
+    PlaybackLoading = 15,
+    PlaybackUnavailable = 16,
+    EndOfTrack = 17,
+    ClientChanged = 18,
+    ExplicitFilterChanged = 19,
+    PlayRequestIdChanged = 20,
+    AddedToQueue = 21,
+    Preloading = 22,
+    TimeToPreloadNextTrack = 23,
+    PositionChanged = 24,
 }
 
 #[repr(C)]
@@ -59,11 +77,21 @@ pub struct TrackMetadata {
 }
 
 #[repr(C)]
-pub union EventData {
-    pub log_msg: *const c_char,
-    pub track: std::mem::ManuallyDrop<TrackMetadata>,
+pub struct EventData {
+    pub play_request_id: u64,
+    pub track_uri: *const c_char,
+    pub position_ms: u32,
+    pub duration_ms: u32,
     pub volume: u16,
+    pub is_playing: bool,
+    pub shuffle: bool,
+    pub repeat_mode: u32,
+    pub auto_play: bool,
+    pub filter_explicit: bool,
+    pub track: ManuallyDrop<TrackMetadata>,
     pub session_user: *const c_char,
+    pub client_name: *const c_char,
+    pub log_msg: *const c_char,
 }
 
 #[repr(C)]
