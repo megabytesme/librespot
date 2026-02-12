@@ -1,6 +1,9 @@
 use crate::{UserDataWrapper, ffi_types::*};
 use futures_util::StreamExt;
-use librespot_connect::{ConnectConfig, Spirc};
+use librespot_connect::{
+    ConnectConfig, LoadContextOptions, LoadRequest, LoadRequestOptions, Options, PlayingTrack,
+    Spirc,
+};
 use librespot_core::{
     Session, SessionConfig, SpotifyUri, authentication::Credentials, cache::Cache,
     config::DeviceType,
@@ -221,9 +224,28 @@ impl Runner {
                         LibrespotCommand::Load { uri, play } => {
                             if let Ok(track_uri) = SpotifyUri::from_uri(&uri) {
                                 if let Some(ref s) = spirc {
-                                    let _ = s.activate().map_err(|e| log::error!("Failed to activate Spirc session: {:?}", e));
+                                    let _ = s.activate().map_err(|e| log::error!("Failed to activate Spirc: {:?}", e));
+
+                                    let context_options = LoadContextOptions::Options(Options {
+                                        shuffle: self.state.shuffle.load(Ordering::Acquire),
+                                        repeat: self.state.repeat.load(Ordering::Acquire) == 1,
+                                        repeat_track: self.state.repeat.load(Ordering::Acquire) == 2,
+                                    });
+
+                                    let options = LoadRequestOptions {
+                                        start_playing: play,
+                                        seek_to: 0,
+                                        context_options: Some(context_options),
+                                        playing_track: Some(PlayingTrack::Uri(uri.clone())),
+                                    };
+
+                                    let request = LoadRequest::from_context_uri(uri, options);
+                                    if let Err(e) = s.load(request) {
+                                        log::error!("Spirc load failed: {:?}", e);
+                                    }
+                                } else {
+                                    player.load(track_uri, play, 0);
                                 }
-                                player.load(track_uri, play, 0);
                             } else {
                                 log::error!("Invalid Spotify URI: {}", uri);
                             }
