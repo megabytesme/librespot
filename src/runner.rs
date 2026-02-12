@@ -146,12 +146,27 @@ impl Runner {
         let mixer = mixer_builder(self.setup.mixer_config.clone()).expect("Failed to create mixer");
         let backend = self.setup.audio_backend;
         let format = self.setup.audio_format;
+        let device = self.setup.device_name.clone();
 
         let player = Player::new(
             self.setup.player_config.clone(),
             session.clone(),
             mixer.get_soft_volume(),
-            move || (backend)(None, format),
+            move || {
+                log::info!(
+                    "Opening audio sink: format={:?}, device={:?}",
+                    format,
+                    device
+                );
+
+                let mut sink = (backend)(Some(device.clone()), format);
+
+                if let Err(e) = sink.start() {
+                    log::error!("Failed to start audio sink: {}", e);
+                }
+
+                sink
+            },
         );
 
         let mut spirc: Option<Spirc> = None;
