@@ -82,11 +82,28 @@ unsafe fn send_cmd(instance: *mut LibrespotInstance, cmd: LibrespotCommand) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn librespot_load(
     instance: *mut LibrespotInstance,
-    uri: *const c_char,
+    context_uri: *const c_char,
+    start_uri: *const c_char,
     play: bool,
 ) {
-    let uri_str = unsafe { CStr::from_ptr(uri).to_string_lossy().into_owned() };
-    unsafe { send_cmd(instance, LibrespotCommand::Load { uri: uri_str, play }) };
+    let context_str = unsafe { CStr::from_ptr(context_uri).to_string_lossy().into_owned() };
+
+    let start_str = if !start_uri.is_null() {
+        Some(unsafe { CStr::from_ptr(start_uri).to_string_lossy().into_owned() })
+    } else {
+        None
+    };
+
+    unsafe {
+        send_cmd(
+            instance,
+            LibrespotCommand::Load {
+                context_uri: context_str,
+                start_from_uri: start_str,
+                play,
+            },
+        )
+    };
 }
 
 #[unsafe(no_mangle)]

@@ -24,7 +24,11 @@ use tokio::sync::mpsc;
 #[derive(Debug)]
 #[allow(dead_code)]
 pub enum LibrespotCommand {
-    Load { uri: String, play: bool },
+    Load {
+        context_uri: String,
+        start_from_uri: Option<String>,
+        play: bool,
+    },
     Play,
     Pause,
     Next,
@@ -35,7 +39,10 @@ pub enum LibrespotCommand {
     SetRepeatContext(bool),
     SetRepeatTrack(bool),
     StartDiscovery,
-    UpdateCredentials { username: String, auth_data: String },
+    UpdateCredentials {
+        username: String,
+        auth_data: String,
+    },
     Stop,
 }
 
@@ -236,10 +243,10 @@ impl Runner {
                                 let _ = s.repeat_track(enabled).map_err(|e| log::error!("Failed to set repeat track: {:?}", e));
                             }
                         }
-                        LibrespotCommand::Load { uri, play } => {
-                            if let Ok(track_uri) = SpotifyUri::from_uri(&uri) {
+                        LibrespotCommand::Load { context_uri, start_from_uri, play } => {
+                            if let Ok(_ctx_uri) = SpotifyUri::from_uri(&context_uri) {
                                 if let Some(ref s) = spirc {
-                                    let _ = s.activate().map_err(|e| log::error!("Failed to activate Spirc: {:?}", e));
+                                    let _ = s.activate();
 
                                     let context_options = LoadContextOptions::Options(Options {
                                         shuffle: self.state.shuffle.load(Ordering::Acquire),
@@ -247,22 +254,25 @@ impl Runner {
                                         repeat_track: self.state.repeat.load(Ordering::Acquire) == 2,
                                     });
 
+                                    let target = start_from_uri.unwrap_or_else(|| context_uri.clone());
+
                                     let options = LoadRequestOptions {
                                         start_playing: play,
                                         seek_to: 0,
                                         context_options: Some(context_options),
-                                        playing_track: Some(PlayingTrack::Uri(uri.clone())),
+                                        playing_track: Some(PlayingTrack::Uri(target)),
                                     };
 
-                                    let request = LoadRequest::from_context_uri(uri, options);
+                                    let request = LoadRequest::from_context_uri(context_uri, options);
                                     if let Err(e) = s.load(request) {
                                         log::error!("Spirc load failed: {:?}", e);
                                     }
                                 } else {
-                                    player.load(track_uri, play, 0);
+                                    let track_to_load = start_from_uri.unwrap_or(context_uri);
+                                    if let Ok(t_uri) = SpotifyUri::from_uri(&track_to_load) {
+                                        player.load(t_uri, play, 0);
+                                    }
                                 }
-                            } else {
-                                log::error!("Invalid Spotify URI: {}", uri);
                             }
                         }
                         LibrespotCommand::UpdateCredentials { username, auth_data } => {
