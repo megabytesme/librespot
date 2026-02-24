@@ -2,8 +2,11 @@ use crate::audio_backend::{Open, Sink, SinkAsBytes, SinkError, SinkResult};
 use crate::config::AudioFormat;
 use crate::convert::Converter;
 use crate::decoder::AudioPacket;
+
 use std::ptr;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::thread;
+use std::time::Duration;
 
 const BUFFER_SIZE: usize = 128 * 1024;
 
@@ -77,20 +80,19 @@ impl SinkAsBytes for UwpSink {
                 return Err(SinkError::NotConnected("Buffer not allocated".into()));
             }
 
-            let len = data.len();
             let cap = BUFFER_SIZE;
 
             loop {
                 let wp = WRITE_POS.load(Ordering::Acquire);
                 let rp = READ_POS.load(Ordering::Acquire);
-
                 let used = (cap + wp - rp) % cap;
                 let free = cap - used - 1;
 
                 if free >= len {
                     break;
                 } else {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    thread::yield_now();
+                    thread::sleep(Duration::from_micros(500));
                 }
             }
 
@@ -108,8 +110,7 @@ impl SinkAsBytes for UwpSink {
                 );
             }
 
-            let new_wp = (wp + len) % cap;
-            WRITE_POS.store(new_wp, Ordering::Release);
+            WRITE_POS.store((wp + len) % cap, Ordering::Release);
         }
         super::TOTAL_WRITTEN.fetch_add(len, Ordering::SeqCst);
         Ok(())
@@ -134,23 +135,4 @@ pub extern "C" fn librespot_audio_get_write_cursor() -> usize {
 #[unsafe(no_mangle)]
 pub extern "C" fn librespot_audio_set_read_cursor(pos: usize) {
     READ_POS.store(pos % BUFFER_SIZE, Ordering::Release);
-
-    if pos == 0xDEADBEEF {
-        eprintln!("UWP: Resetting cursor");
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn librespot_audio_get_format() -> u32 {
-    AUDIO_FORMAT.load(Ordering::Acquire)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn librespot_audio_get_sample_rate() -> u32 {
-    SAMPLE_RATE.load(Ordering::Acquire)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn librespot_audio_get_channels() -> u32 {
-    CHANNELS.load(Ordering::Acquire)
 }
