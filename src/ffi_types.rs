@@ -3,6 +3,8 @@ use std::{
     mem::ManuallyDrop,
 };
 
+use librespot_core::{LibrespotKeyCallback, LibrespotKeySaveCallback};
+
 #[repr(C)]
 pub struct LibrespotConfig {
     pub device_name: *const c_char,
@@ -16,7 +18,8 @@ pub struct LibrespotConfig {
     pub password: *const c_char,
     pub auth_blob: *const c_char,
     pub access_token: *const c_char,
-    pub key_callback: Option<librespot_core::LibrespotKeyCallback>, // New
+    pub key_callback: Option<LibrespotKeyCallback>,
+    pub key_save_callback: Option<LibrespotKeySaveCallback>,
 }
 
 #[repr(i32)]

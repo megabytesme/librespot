@@ -6,8 +6,8 @@ use thiserror::Error;
 use tokio::sync::oneshot;
 
 use crate::{
-    Error, FileId, LibrespotKeyCallback, SpotifyId, UserDataPtr, packet::PacketType,
-    util::SeqGenerator,
+    Error, FileId, LibrespotKeyCallback, LibrespotKeySaveCallback, SpotifyId, UserDataPtr,
+    packet::PacketType, util::SeqGenerator,
 };
 
 use std::ffi::c_void;
@@ -46,6 +46,7 @@ component! {
         sequence: SeqGenerator<u32> = SeqGenerator::new(0),
         pending: HashMap<u32, oneshot::Sender<Result<AudioKey, Error>>> = HashMap::new(),
         key_callback: Option<LibrespotKeyCallback> = None,
+        key_save_callback: Option<LibrespotKeySaveCallback> = None,
         user_data: Option<UserDataPtr> = None,
     }
 }
@@ -135,12 +136,25 @@ impl AudioKeyManager {
                 Err(AudioKeyError::Timeout.into())
             }
             Ok(k) => {
-                let result = k?;
+                let result: AudioKey = k.map_err(|_| AudioKeyError::Channel)??;
+
+                self.lock(|inner| {
+                    if let Some(save_cb) = inner.key_save_callback {
+                        let track_bytes = track.to_raw();
+                        save_cb(
+                            track_bytes.as_ptr(),
+                            result.0.as_ptr(),
+                            inner.user_data.map(|u| u.0).unwrap_or(std::ptr::null_mut()),
+                        );
+                    }
+                });
+
                 trace!(
                     "Audio key for track {} received from Spotify",
                     track.to_base62()
                 );
-                result
+
+                Ok(result)
             }
         }
     }
@@ -155,9 +169,15 @@ impl AudioKeyManager {
         self.session().send_packet(PacketType::RequestKey, data)
     }
 
-    pub fn set_ffi_hooks(&self, callback: Option<LibrespotKeyCallback>, user_data: *mut c_void) {
+    pub fn set_ffi_hooks(
+        &self,
+        callback: Option<LibrespotKeyCallback>,
+        save_callback: Option<LibrespotKeySaveCallback>,
+        user_data: *mut c_void,
+    ) {
         self.lock(|inner| {
             inner.key_callback = callback;
+            inner.key_save_callback = save_callback;
             inner.user_data = Some(UserDataPtr(user_data));
         });
     }

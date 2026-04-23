@@ -59,6 +59,7 @@ pub struct RunnerSetup {
     pub device_type: DeviceType,
     pub zeroconf_port: u16,
     pub key_callback: Option<librespot_core::LibrespotKeyCallback>,
+    pub key_save_callback: Option<librespot_core::LibrespotKeySaveCallback>,
 }
 
 pub struct TrackMetadataInternal {
@@ -150,9 +151,11 @@ impl Runner {
         .ok();
 
         let mut session = Session::new(self.setup.session_config.clone(), cache.clone());
-        session
-            .audio_key()
-            .set_ffi_hooks(self.setup.key_callback, self.user_data.0);
+        session.audio_key().set_ffi_hooks(
+            self.setup.key_callback,
+            self.setup.key_save_callback,
+            self.user_data.0,
+        );
         let mixer_builder = mixer::find(None).expect("No mixer found");
         let mixer = mixer_builder(self.setup.mixer_config.clone()).expect("Failed to create mixer");
         let backend = self.setup.audio_backend;

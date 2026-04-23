@@ -58,3 +58,6 @@ pub type LibrespotKeyCallback = extern "C" fn(
     key_out: *mut u8,
     user_data: *mut c_void,
 ) -> bool;
+
+pub type LibrespotKeySaveCallback =
+    extern "C" fn(track_id: *const u8, key_in: *const u8, user_data: *mut c_void);

@@ -111,6 +111,7 @@ pub fn parse_ffi_config(c_cfg: &LibrespotConfig) -> Result<RunnerSetup, String> 
             device_type,
             zeroconf_port: 0,
             key_callback: c_cfg.key_callback,
+            key_save_callback: c_cfg.key_save_callback,
         })
     }
 }
