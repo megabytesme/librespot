@@ -2,7 +2,7 @@
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::{
     cmp::Reverse,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -18,6 +18,7 @@ use crate::{
 };
 
 const CACHE_LIMITER_POISON_MSG: &str = "cache limiter mutex should not be poisoned";
+const PENDING_DELETE_FILE: &str = ".pending_delete";
 
 #[derive(Debug, Error)]
 pub enum CacheError {
@@ -118,6 +119,9 @@ impl SizeLimiter {
 
 struct FsSizeLimiter {
     limiter: Mutex<SizeLimiter>,
+    volatile_root: PathBuf,
+    pending_delete_file: PathBuf,
+    pending_delete_lock: Mutex<()>,
 }
 
 impl FsSizeLimiter {
@@ -142,7 +146,7 @@ impl FsSizeLimiter {
     }
 
     /// Recursively search a directory for files and add them to the `limiter` struct.
-    fn init_dir(limiter: &mut SizeLimiter, path: &Path) {
+    fn init_dir(limiter: &mut SizeLimiter, path: &Path, pending_delete_file: &Path) {
         let list_dir = match fs::read_dir(path) {
             Ok(list_dir) => list_dir,
             Err(e) => {
@@ -155,40 +159,33 @@ impl FsSizeLimiter {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(e) => {
-                    warn!("Could not directory {path:?} in cache dir: {e}");
+                    warn!("Could not read directory {path:?} in cache dir: {e}");
                     return;
                 }
             };
 
+            let entry_path = entry.path();
+
+            if entry_path == pending_delete_file {
+                continue;
+            }
+
             match entry.file_type() {
                 Ok(file_type) if file_type.is_dir() || file_type.is_symlink() => {
-                    Self::init_dir(limiter, &entry.path())
+                    Self::init_dir(limiter, &entry_path, pending_delete_file)
                 }
-                Ok(file_type) if file_type.is_file() => {
-                    let path = entry.path();
-                    match Self::get_metadata(&path) {
-                        Ok((access_time, size)) => {
-                            limiter.add(&path, size, access_time);
-                        }
-                        Err(e) => {
-                            warn!("Could not read file {path:?} in cache dir: {e}")
-                        }
-                    }
-                }
-                Ok(ft) => {
-                    warn!(
-                        "File {:?} in cache dir has unsupported type {:?}",
-                        entry.path(),
-                        ft
-                    )
-                }
-                Err(e) => {
-                    warn!(
-                        "Could not get type of file {:?} in cache dir: {}",
-                        entry.path(),
-                        e
-                    )
-                }
+                Ok(file_type) if file_type.is_file() => match Self::get_metadata(&entry_path) {
+                    Ok((access_time, size)) => limiter.add(&entry_path, size, access_time),
+                    Err(e) => warn!("Could not read file {entry_path:?} in cache dir: {e}"),
+                },
+                Ok(ft) => warn!(
+                    "File {:?} in cache dir has unsupported type {:?}",
+                    entry_path, ft
+                ),
+                Err(e) => warn!(
+                    "Could not get type of file {:?} in cache dir: {}",
+                    entry_path, e
+                ),
             };
         }
     }
@@ -214,7 +211,145 @@ impl FsSizeLimiter {
             .remove(file)
     }
 
+    fn with_pending_delete_set<R, F>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut HashSet<PathBuf>) -> R,
+    {
+        let _guard = self
+            .pending_delete_lock
+            .lock()
+            .expect(CACHE_LIMITER_POISON_MSG);
+
+        let mut set = HashSet::new();
+
+        if let Ok(content) = fs::read_to_string(&self.pending_delete_file) {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    set.insert(PathBuf::from(trimmed));
+                }
+            }
+        }
+
+        let result = f(&mut set);
+
+        let mut entries: Vec<_> = set.iter().collect();
+        entries.sort();
+
+        let mut contents = String::new();
+        for rel in entries {
+            contents.push_str(&rel.to_string_lossy());
+            contents.push('\n');
+        }
+
+        if let Err(e) = fs::write(&self.pending_delete_file, contents) {
+            warn!("Could not write pending delete queue: {e}");
+        }
+
+        result
+    }
+
+    fn enqueue_pending_delete(&self, file: &Path) {
+        if !file.starts_with(&self.volatile_root) {
+            return;
+        }
+
+        let relative = match file.strip_prefix(&self.volatile_root) {
+            Ok(p) => p.to_path_buf(),
+            Err(_) => return,
+        };
+
+        self.with_pending_delete_set(|set| {
+            set.insert(relative);
+        });
+    }
+
+    fn remove_pending_delete(&self, file: &Path) {
+        if !file.starts_with(&self.volatile_root) {
+            return;
+        }
+
+        let relative = match file.strip_prefix(&self.volatile_root) {
+            Ok(p) => p.to_path_buf(),
+            Err(_) => return,
+        };
+
+        self.with_pending_delete_set(|set| {
+            set.remove(&relative);
+        });
+    }
+
+    fn list_pending_deletes(&self) -> Vec<PathBuf> {
+        self.with_pending_delete_set(|set| set.iter().cloned().collect())
+    }
+
+    fn invoke_remove_callback_for_path(
+        &self,
+        file_path: &Path,
+        remove_callback: Option<LibrespotKeyRemoveCallback>,
+    ) {
+        let Some(cb) = remove_callback else {
+            return;
+        };
+
+        let Some(file_name) = file_path.file_name().and_then(|n| n.to_str()) else {
+            return;
+        };
+
+        let Some(parent) = file_path
+            .parent()
+            .and_then(|p| p.file_name().and_then(|n| n.to_str()))
+        else {
+            return;
+        };
+
+        let full_hex_id = format!("{}{}", parent, file_name);
+
+        if let Ok(bytes) = (0..full_hex_id.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&full_hex_id[i..i + 2], 16))
+            .collect::<Result<Vec<u8>, _>>()
+        {
+            cb(bytes.as_ptr(), std::ptr::null_mut());
+        }
+    }
+
+    fn process_pending_deletes(&self, remove_callback: Option<LibrespotKeyRemoveCallback>) {
+        let entries = self.list_pending_deletes();
+        if entries.is_empty() {
+            return;
+        }
+
+        let mut removed = 0usize;
+
+        for rel in entries {
+            let full = self.volatile_root.join(&rel);
+
+            if !full.exists() {
+                self.remove_pending_delete(&full);
+                removed += 1;
+                continue;
+            }
+
+            match fs::remove_file(&full) {
+                Ok(_) => {
+                    self.remove_pending_delete(&full);
+                    self.invoke_remove_callback_for_path(&full, remove_callback);
+                    removed += 1;
+                }
+                Err(e) => {
+                    warn!("Pending delete retry failed for {full:?}: {e}");
+                }
+            }
+        }
+
+        if removed > 0 {
+            info!("Processed {removed} pending cache deletions.");
+        }
+    }
+
     fn prune_internal<F: FnMut() -> Option<PathBuf>>(
+        &self,
         mut pop: F,
         remove_callback: Option<LibrespotKeyRemoveCallback>,
     ) -> Result<(), Error> {
@@ -222,39 +357,31 @@ impl FsSizeLimiter {
         let mut count = 0;
         let mut last_error = None;
 
+        self.process_pending_deletes(remove_callback);
+
         while let Some(file_path) = pop() {
             if first {
                 debug!("Cache dir exceeds limit, removing least recently used files.");
                 first = false;
             }
 
-            if let Some(cb) = remove_callback {
-                if let Some(file_name) = file_path.file_name().and_then(|n| n.to_str()) {
-                    if let Some(parent) = file_path
-                        .parent()
-                        .and_then(|p| p.file_name().and_then(|n| n.to_str()))
-                    {
-                        let full_hex_id = format!("{}{}", parent, file_name);
-
-                        if let Ok(bytes) = (0..full_hex_id.len())
-                            .step_by(2)
-                            .map(|i| u8::from_str_radix(&full_hex_id[i..i + 2], 16))
-                            .collect::<Result<Vec<u8>, _>>()
-                        {
-                            cb(bytes.as_ptr(), std::ptr::null_mut());
-                        }
-                    }
+            match fs::remove_file(&file_path) {
+                Ok(_) => {
+                    self.remove_pending_delete(&file_path);
+                    self.invoke_remove_callback_for_path(&file_path, remove_callback);
+                    count += 1;
+                }
+                Err(e) => {
+                    warn!(
+                        "Could not remove file {file_path:?} from cache dir: {e}; queued for retry"
+                    );
+                    self.enqueue_pending_delete(&file_path);
+                    last_error = Some(e);
                 }
             }
-
-            let res = fs::remove_file(&file_path);
-            if let Err(e) = res {
-                warn!("Could not remove file {file_path:?} from cache dir: {e}");
-                last_error = Some(e);
-            } else {
-                count += 1;
-            }
         }
+
+        self.process_pending_deletes(remove_callback);
 
         if count > 0 {
             info!("Removed {count} cache files.");
@@ -268,7 +395,7 @@ impl FsSizeLimiter {
     }
 
     fn prune(&self, remove_callback: Option<LibrespotKeyRemoveCallback>) -> Result<(), Error> {
-        Self::prune_internal(
+        self.prune_internal(
             || self.limiter.lock().expect(CACHE_LIMITER_POISON_MSG).pop(),
             remove_callback,
         )
@@ -279,23 +406,31 @@ impl FsSizeLimiter {
         limit: u64,
         remove_callback: Option<LibrespotKeyRemoveCallback>,
     ) -> Result<Self, Error> {
+        let pending_delete_file = path.join(PENDING_DELETE_FILE);
         let mut limiter = SizeLimiter::new(limit);
 
-        Self::init_dir(&mut limiter, path);
-        Self::prune_internal(|| limiter.pop(), remove_callback)?;
+        Self::init_dir(&mut limiter, path, &pending_delete_file);
 
-        Ok(Self {
+        let this = Self {
             limiter: Mutex::new(limiter),
-        })
+            volatile_root: path.to_path_buf(),
+            pending_delete_file,
+            pending_delete_lock: Mutex::new(()),
+        };
+
+        this.process_pending_deletes(remove_callback);
+        this.prune(remove_callback)?;
+
+        Ok(this)
     }
 }
 
-/// A cache for volume, credentials and audio files.
 #[derive(Clone)]
 pub struct Cache {
     credentials_location: Option<PathBuf>,
     volume_location: Option<PathBuf>,
     audio_location: Option<PathBuf>,
+    persisted_audio_location: Option<PathBuf>,
     size_limiter: Option<Arc<FsSizeLimiter>>,
     remove_callback: Option<LibrespotKeyRemoveCallback>,
 }
@@ -305,6 +440,7 @@ impl Cache {
         credentials_path: Option<P>,
         volume_path: Option<P>,
         audio_path: Option<P>,
+        persisted_audio_path: Option<P>,
         size_limit: Option<u64>,
         remove_callback: Option<LibrespotKeyRemoveCallback>,
     ) -> Result<Self, Error> {
@@ -313,7 +449,6 @@ impl Cache {
         if let Some(location) = &credentials_path {
             fs::create_dir_all(location)?;
         }
-
         let credentials_location = credentials_path
             .as_ref()
             .map(|p| p.as_ref().join("credentials.json"));
@@ -321,29 +456,101 @@ impl Cache {
         if let Some(location) = &volume_path {
             fs::create_dir_all(location)?;
         }
-
         let volume_location = volume_path.as_ref().map(|p| p.as_ref().join("volume"));
 
         if let Some(location) = &audio_path {
             fs::create_dir_all(location)?;
-
             if let Some(limit) = size_limit {
                 let limiter = FsSizeLimiter::new(location.as_ref(), limit, remove_callback)?;
                 size_limiter = Some(Arc::new(limiter));
             }
         }
 
-        let audio_location = audio_path.map(|p| p.as_ref().to_owned());
+        if let Some(location) = &persisted_audio_path {
+            fs::create_dir_all(location)?;
+        }
 
-        let cache = Cache {
+        let audio_location = audio_path.map(|p| p.as_ref().to_owned());
+        let persisted_audio_location = persisted_audio_path.map(|p| p.as_ref().to_owned());
+
+        Ok(Self {
             credentials_location,
             volume_location,
             audio_location,
+            persisted_audio_location,
             size_limiter,
             remove_callback,
+        })
+    }
+
+    fn file_subpath(file: FileId) -> PathBuf {
+        let name = file.to_base16();
+        let mut path = PathBuf::from(&name[0..2]);
+        path.push(&name[2..]);
+        path
+    }
+
+    pub fn volatile_file_path(&self, file: FileId) -> Option<PathBuf> {
+        self.audio_location
+            .as_ref()
+            .map(|root| root.join(Self::file_subpath(file)))
+    }
+
+    pub fn persisted_file_path(&self, file: FileId) -> Option<PathBuf> {
+        self.persisted_audio_location
+            .as_ref()
+            .map(|root| root.join(Self::file_subpath(file)))
+    }
+
+    pub fn file_path(&self, file: FileId) -> Option<PathBuf> {
+        if let Some(path) = self.persisted_file_path(file) {
+            if path.exists() {
+                return Some(path);
+            }
+        }
+
+        if let Some(path) = self.volatile_file_path(file) {
+            if path.exists() {
+                return Some(path);
+            }
+        }
+
+        self.persisted_file_path(file)
+            .or_else(|| self.volatile_file_path(file))
+    }
+
+    pub fn set_persisted(&self, file: FileId, persisted: bool) -> Result<(), Error> {
+        let volatile = self.volatile_file_path(file).ok_or(CacheError::Path)?;
+        let stable = self.persisted_file_path(file).ok_or(CacheError::Path)?;
+
+        let (src, dst) = if persisted {
+            (&volatile, &stable)
+        } else {
+            (&stable, &volatile)
         };
 
-        Ok(cache)
+        if !src.exists() {
+            return Err(Error::not_found(format!("cache file not found: {src:?}")));
+        }
+
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        fs::rename(src, dst)?;
+
+        if let Some(limiter) = self.size_limiter.as_deref() {
+            if persisted {
+                limiter.remove(&volatile);
+                limiter.remove_pending_delete(&volatile);
+            } else {
+                let (_, size) = FsSizeLimiter::get_metadata(&volatile)?;
+                limiter.add(&volatile, size);
+                limiter.prune(self.remove_callback)?;
+            }
+        }
+
+        Ok(())
     }
 
     pub fn credentials(&self) -> Option<Credentials> {
@@ -355,7 +562,7 @@ impl Cache {
             #[cfg(unix)]
             if file.metadata()?.mode() & 0o004 != 0 {
                 warn!(
-                    "credential file {location:?} is currently world readable, consider using  chmod 600 {location:?} to fix this"
+                    "credential file {location:?} is currently world readable, consider using chmod 600 {location:?} to fix this"
                 )
             }
             Ok(serde_json::from_reader(file)?)
@@ -422,29 +629,26 @@ impl Cache {
         }
     }
 
-    pub fn file_path(&self, file: FileId) -> Option<PathBuf> {
-        self.audio_location.as_ref().map(|location| {
-            let name = file.to_base16();
-            let mut path = location.join(&name[0..2]);
-            path.push(&name[2..]);
-            path
-        })
-    }
-
     pub fn file(&self, file: FileId) -> Option<File> {
         let path = self.file_path(file)?;
         match File::open(&path) {
-            Ok(file) => {
+            Ok(file_handle) => {
                 if let Some(limiter) = self.size_limiter.as_deref() {
-                    if !limiter.touch(&path) {
-                        error!("limiter could not touch {path:?}");
+                    if self
+                        .audio_location
+                        .as_ref()
+                        .is_some_and(|root| path.starts_with(root))
+                    {
+                        if !limiter.touch(&path) {
+                            error!("limiter could not touch {path:?}");
+                        }
                     }
                 }
-                Some(file)
+                Some(file_handle)
             }
             Err(e) => {
                 if e.kind() != io::ErrorKind::NotFound {
-                    warn!("Error reading file from cache: {e}")
+                    warn!("Error reading file from cache: {e}");
                 }
                 None
             }
@@ -452,39 +656,73 @@ impl Cache {
     }
 
     pub fn save_file<F: Read>(&self, file: FileId, contents: &mut F) -> Result<PathBuf, Error> {
-        if let Some(path) = self.file_path(file) {
-            if let Some(parent) = path.parent() {
-                if let Ok(size) = fs::create_dir_all(parent)
-                    .and_then(|_| File::create(&path))
-                    .and_then(|mut file| io::copy(contents, &mut file))
-                {
-                    if let Some(limiter) = self.size_limiter.as_deref() {
-                        limiter.add(&path, size);
-                        limiter.prune(self.remove_callback)?;
-                    }
-                    return Ok(path);
-                }
+        let path = self.volatile_file_path(file).ok_or(CacheError::Path)?;
+
+        if let Some(parent) = path.parent() {
+            let size = fs::create_dir_all(parent)
+                .and_then(|_| File::create(&path))
+                .and_then(|mut file| io::copy(contents, &mut file))?;
+
+            if let Some(limiter) = self.size_limiter.as_deref() {
+                limiter.remove_pending_delete(&path);
+                limiter.add(&path, size);
+                limiter.prune(self.remove_callback)?;
             }
+
+            Ok(path)
+        } else {
+            Err(CacheError::Path.into())
         }
-        Err(CacheError::Path.into())
     }
 
     pub fn remove_file(&self, file: FileId) -> Result<(), Error> {
-        let path = self.file_path(file).ok_or(CacheError::Path)?;
+        let volatile = self.volatile_file_path(file);
+        let stable = self.persisted_file_path(file);
 
-        fs::remove_file(&path)?;
-        if let Some(limiter) = self.size_limiter.as_deref() {
-            limiter.remove(&path);
+        let path = match (stable.as_ref(), volatile.as_ref()) {
+            (Some(p), _) if p.exists() => p.clone(),
+            (_, Some(p)) if p.exists() => p.clone(),
+            _ => return Err(CacheError::Path.into()),
+        };
+
+        match fs::remove_file(&path) {
+            Ok(_) => {
+                if let Some(cb) = self.remove_callback {
+                    let hex_id = file.to_base16();
+                    if let Ok(bytes) = (0..hex_id.len())
+                        .step_by(2)
+                        .map(|i| u8::from_str_radix(&hex_id[i..i + 2], 16))
+                        .collect::<Result<Vec<u8>, _>>()
+                    {
+                        cb(bytes.as_ptr(), std::ptr::null_mut());
+                    }
+                }
+            }
+            Err(e) => {
+                if self
+                    .audio_location
+                    .as_ref()
+                    .is_some_and(|root| path.starts_with(root))
+                {
+                    if let Some(limiter) = self.size_limiter.as_deref() {
+                        limiter.remove(&path);
+                        limiter.enqueue_pending_delete(&path);
+                    }
+                    return Ok(());
+                } else {
+                    return Err(e.into());
+                }
+            }
         }
 
-        if let Some(cb) = self.remove_callback {
-            let hex_id = file.to_base16();
-            if let Ok(bytes) = (0..hex_id.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&hex_id[i..i + 2], 16))
-                .collect::<Result<Vec<u8>, _>>()
+        if let Some(limiter) = self.size_limiter.as_deref() {
+            if self
+                .audio_location
+                .as_ref()
+                .is_some_and(|root| path.starts_with(root))
             {
-                cb(bytes.as_ptr(), std::ptr::null_mut());
+                limiter.remove(&path);
+                limiter.remove_pending_delete(&path);
             }
         }
 

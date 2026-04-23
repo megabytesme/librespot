@@ -17,7 +17,7 @@ use librespot_playback::{
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, atomic::AtomicU8};
-use std::{ffi::CString, sync::atomic::AtomicUsize};
+use std::{ffi::CString, path::PathBuf, sync::atomic::AtomicUsize};
 use std::{mem::ManuallyDrop, pin::Pin};
 use tokio::sync::mpsc;
 
@@ -61,6 +61,8 @@ pub struct RunnerSetup {
     pub key_callback: Option<librespot_core::LibrespotKeyCallback>,
     pub key_save_callback: Option<librespot_core::LibrespotKeySaveCallback>,
     pub key_remove_callback: Option<librespot_core::LibrespotKeyRemoveCallback>,
+    pub cache_dir: PathBuf,
+    pub persisted_cache_dir: PathBuf,
 }
 
 pub struct TrackMetadataInternal {
@@ -113,6 +115,7 @@ impl RunnerState {
 
 pub struct Runner {
     setup: RunnerSetup,
+    cache: Arc<Cache>,
     cmd_rx: mpsc::UnboundedReceiver<LibrespotCommand>,
     callback: LibrespotCallback,
     user_data: UserDataWrapper,
@@ -122,6 +125,7 @@ pub struct Runner {
 impl Runner {
     pub fn new(
         setup: RunnerSetup,
+        cache: Arc<Cache>,
         cmd_rx: mpsc::UnboundedReceiver<LibrespotCommand>,
         callback: LibrespotCallback,
         user_data: UserDataWrapper,
@@ -129,6 +133,7 @@ impl Runner {
     ) -> Self {
         Self {
             setup,
+            cache,
             cmd_rx,
             callback,
             user_data,
@@ -143,21 +148,17 @@ impl Runner {
     pub async fn run(&mut self) {
         log::info!("Runner::run() starting");
 
-        let cache = Cache::new(
-            Some(self.setup.session_config.tmp_dir.clone()),
-            Some(self.setup.session_config.tmp_dir.clone()),
-            Some(self.setup.session_config.tmp_dir.join("audio")),
-            Some(1024 * 1024 * 500),
-            self.setup.key_remove_callback,
-        )
-        .ok();
+        let mut session = Session::new(
+            self.setup.session_config.clone(),
+            Some((*self.cache).clone()),
+        );
 
-        let mut session = Session::new(self.setup.session_config.clone(), cache.clone());
         session.audio_key().set_ffi_hooks(
             self.setup.key_callback,
             self.setup.key_save_callback,
             self.user_data.0,
         );
+
         let mixer_builder = mixer::find(None).expect("No mixer found");
         let mixer = mixer_builder(self.setup.mixer_config.clone()).expect("Failed to create mixer");
         let backend = self.setup.audio_backend;
@@ -285,12 +286,12 @@ impl Runner {
                             }
                         }
                         LibrespotCommand::UpdateCredentials { username, auth_data } => {
-                                log::info!("Updating credentials: User {}", username);
-                                last_creds = Some(Credentials::with_password(username, auth_data));
-                                connecting = true;
-                                if let Some(s) = spirc.take() { let _ = s.shutdown(); }
-                                spirc_task = None;
-                            }
+                            log::info!("Updating credentials: User {}", username);
+                            last_creds = Some(Credentials::with_password(username, auth_data));
+                            connecting = true;
+                            if let Some(s) = spirc.take() { let _ = s.shutdown(); }
+                            spirc_task = None;
+                        }
                         LibrespotCommand::StartDiscovery => {
                             if discovery.is_none() {
                                 log::info!("Starting discovery broadcast");
@@ -326,7 +327,10 @@ impl Runner {
 
                 _ = async {}, if connecting && last_creds.is_some() => {
                     if session.is_invalid() {
-                        session = Session::new(self.setup.session_config.clone(), cache.clone());
+                        session = Session::new(
+                            self.setup.session_config.clone(),
+                            Some((*self.cache).clone()),
+                        );
                         player.set_session(session.clone());
                     }
 
@@ -344,7 +348,10 @@ impl Runner {
                             Ok((s, task)) => {
                                 spirc = Some(s);
                                 spirc_task = Some(Box::pin(task));
-                                self.emit(LibrespotEvent { event_type: EventType::SessionConnected, data: unsafe { std::mem::zeroed() } });
+                                self.emit(LibrespotEvent {
+                                    event_type: EventType::SessionConnected,
+                                    data: unsafe { std::mem::zeroed() }
+                                });
                                 connecting = false;
                             }
                             Err(e) => log::error!("Spirc connection failed: {:?}", e),
@@ -357,7 +364,10 @@ impl Runner {
                 }, if spirc_task.is_some() => {
                     spirc_task = None;
                     spirc = None;
-                    self.emit(LibrespotEvent { event_type: EventType::SessionDisconnected, data: unsafe { std::mem::zeroed() } });
+                    self.emit(LibrespotEvent {
+                        event_type: EventType::SessionDisconnected,
+                        data: unsafe { std::mem::zeroed() }
+                    });
                 }
             }
         }

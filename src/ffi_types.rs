@@ -10,6 +10,7 @@ pub struct LibrespotConfig {
     pub device_name: *const c_char,
     pub device_type: *const c_char,
     pub cache_dir: *const c_char,
+    pub persisted_cache_dir: *const c_char,
     pub enable_discovery: bool,
     pub enable_volume_normalisation: bool,
     pub bitrate: Bitrate,

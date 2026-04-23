@@ -13,9 +13,14 @@ use std::str::FromStr;
 
 pub fn parse_ffi_config(c_cfg: &LibrespotConfig) -> Result<RunnerSetup, String> {
     unsafe {
-        if c_cfg.device_name.is_null() || c_cfg.device_type.is_null() || c_cfg.cache_dir.is_null() {
+        if c_cfg.device_name.is_null()
+            || c_cfg.device_type.is_null()
+            || c_cfg.cache_dir.is_null()
+            || c_cfg.persisted_cache_dir.is_null()
+        {
             return Err(
-                "Mandatory configuration strings (name, type, or cache) are NULL".to_string(),
+                "Mandatory configuration strings (name, type, cache_dir, persisted_cache_dir) are NULL"
+                    .to_string(),
             );
         }
 
@@ -38,8 +43,12 @@ pub fn parse_ffi_config(c_cfg: &LibrespotConfig) -> Result<RunnerSetup, String> 
             .to_string_lossy()
             .into_owned();
         let device_type_str = CStr::from_ptr(c_cfg.device_type).to_string_lossy();
+
         let cache_path = CStr::from_ptr(c_cfg.cache_dir).to_string_lossy();
-        let path = PathBuf::from(cache_path.as_ref());
+        let persisted_cache_path = CStr::from_ptr(c_cfg.persisted_cache_dir).to_string_lossy();
+
+        let cache_dir = PathBuf::from(cache_path.as_ref());
+        let persisted_cache_dir = PathBuf::from(persisted_cache_path.as_ref());
 
         let initial_creds = if !c_cfg.access_token.is_null() {
             let token = CStr::from_ptr(c_cfg.access_token)
@@ -66,7 +75,7 @@ pub fn parse_ffi_config(c_cfg: &LibrespotConfig) -> Result<RunnerSetup, String> 
 
         let session_config = SessionConfig {
             device_id: device_id.clone(),
-            tmp_dir: path.clone(),
+            tmp_dir: cache_dir.clone(),
             ..SessionConfig::default()
         };
 
@@ -113,6 +122,8 @@ pub fn parse_ffi_config(c_cfg: &LibrespotConfig) -> Result<RunnerSetup, String> 
             key_callback: c_cfg.key_callback,
             key_save_callback: c_cfg.key_save_callback,
             key_remove_callback: c_cfg.key_remove_callback,
+            cache_dir,
+            persisted_cache_dir,
         })
     }
 }

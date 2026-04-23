@@ -5,6 +5,7 @@ mod runner;
 
 use crate::ffi_types::*;
 use crate::runner::{LibrespotCommand, Runner, RunnerState};
+use librespot_core::{FileId, cache::Cache};
 use std::ffi::{CStr, c_char};
 use std::os::raw::c_void;
 use std::sync::Arc;
@@ -15,6 +16,7 @@ use tokio::sync::mpsc;
 pub struct LibrespotInstance {
     cmd_tx: mpsc::UnboundedSender<LibrespotCommand>,
     state: Arc<RunnerState>,
+    cache: Arc<Cache>,
     _thread_handle: thread::JoinHandle<()>,
 }
 
@@ -39,18 +41,41 @@ pub unsafe extern "C" fn librespot_new(
         }
     };
 
+    let cache = match Cache::new(
+        Some(setup.cache_dir.clone()),
+        Some(setup.cache_dir.clone()),
+        Some(setup.cache_dir.join("audio")),
+        Some(setup.persisted_cache_dir.join("audio")),
+        Some(1024 * 1024 * 500),
+        setup.key_remove_callback,
+    ) {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            eprintln!("Failed to create cache: {e}");
+            return std::ptr::null_mut();
+        }
+    };
+
     let (tx, rx) = mpsc::unbounded_channel();
 
     let runner_state = Arc::new(RunnerState::new(setup.audio_format, 44100));
     let state_for_thread = runner_state.clone();
+    let cache_for_thread = cache.clone();
 
     let user_data_wrapper = UserDataWrapper(user_data);
 
-    let thread_handle = std::thread::spawn(move || {
+    let thread_handle = thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
 
         rt.block_on(async move {
-            let mut runner = Runner::new(setup, rx, callback, user_data_wrapper, state_for_thread);
+            let mut runner = Runner::new(
+                setup,
+                cache_for_thread,
+                rx,
+                callback,
+                user_data_wrapper,
+                state_for_thread,
+            );
             runner.run().await;
         });
     });
@@ -58,6 +83,7 @@ pub unsafe extern "C" fn librespot_new(
     let instance = Box::new(LibrespotInstance {
         cmd_tx: tx,
         state: runner_state,
+        cache,
         _thread_handle: thread_handle,
     });
 
@@ -73,10 +99,46 @@ pub unsafe extern "C" fn librespot_free(instance: *mut LibrespotInstance) {
     }
 }
 
-unsafe fn send_cmd(instance: *mut LibrespotInstance, cmd: LibrespotCommand) {
-    if let Some(inst) = unsafe { instance.as_ref() } {
+fn send_cmd(instance: *mut LibrespotInstance, cmd: LibrespotCommand) {
+    let inst = unsafe { instance.as_ref() };
+    if let Some(inst) = inst {
         let _ = inst.cmd_tx.send(cmd);
     }
+}
+
+fn parse_file_id_hex(s: &str) -> Option<FileId> {
+    let bytes = hex::decode(s).ok()?;
+    Some(FileId::from_raw(&bytes))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn librespot_cache_set_persisted(
+    instance: *mut LibrespotInstance,
+    file_id_hex: *const c_char,
+    persisted: bool,
+) -> bool {
+    if instance.is_null() || file_id_hex.is_null() {
+        return false;
+    }
+
+    let inst = unsafe { instance.as_ref() };
+    let inst = match inst {
+        Some(i) => i,
+        None => return false,
+    };
+
+    let hex = unsafe { CStr::from_ptr(file_id_hex) };
+    let hex = match hex.to_str() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    let file_id = match parse_file_id_hex(hex) {
+        Some(id) => id,
+        None => return false,
+    };
+
+    inst.cache.set_persisted(file_id, persisted).is_ok()
 }
 
 #[unsafe(no_mangle)]
@@ -86,77 +148,80 @@ pub unsafe extern "C" fn librespot_load(
     start_uri: *const c_char,
     play: bool,
 ) {
-    let context_str = unsafe { CStr::from_ptr(context_uri).to_string_lossy().into_owned() };
+    let context_str = unsafe { CStr::from_ptr(context_uri) }
+        .to_string_lossy()
+        .into_owned();
 
     let start_str = if !start_uri.is_null() {
-        Some(unsafe { CStr::from_ptr(start_uri).to_string_lossy().into_owned() })
+        Some(
+            unsafe { CStr::from_ptr(start_uri) }
+                .to_string_lossy()
+                .into_owned(),
+        )
     } else {
         None
     };
 
-    unsafe {
-        send_cmd(
-            instance,
-            LibrespotCommand::Load {
-                context_uri: context_str,
-                start_from_uri: start_str,
-                play,
-            },
-        )
-    };
+    send_cmd(
+        instance,
+        LibrespotCommand::Load {
+            context_uri: context_str,
+            start_from_uri: start_str,
+            play,
+        },
+    );
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn librespot_play(instance: *mut LibrespotInstance) {
-    unsafe { send_cmd(instance, LibrespotCommand::Play) };
+    send_cmd(instance, LibrespotCommand::Play);
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn librespot_pause(instance: *mut LibrespotInstance) {
-    unsafe { send_cmd(instance, LibrespotCommand::Pause) };
+    send_cmd(instance, LibrespotCommand::Pause);
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn librespot_stop(instance: *mut LibrespotInstance) {
-    unsafe { send_cmd(instance, LibrespotCommand::Stop) };
+    send_cmd(instance, LibrespotCommand::Stop);
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn librespot_next(instance: *mut LibrespotInstance) {
-    unsafe { send_cmd(instance, LibrespotCommand::Next) };
+    send_cmd(instance, LibrespotCommand::Next);
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn librespot_prev(instance: *mut LibrespotInstance) {
-    unsafe { send_cmd(instance, LibrespotCommand::Prev) };
+    send_cmd(instance, LibrespotCommand::Prev);
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn librespot_seek(instance: *mut LibrespotInstance, pos_ms: u32) {
-    unsafe { send_cmd(instance, LibrespotCommand::Seek(pos_ms)) };
+    send_cmd(instance, LibrespotCommand::Seek(pos_ms));
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn librespot_set_volume(instance: *mut LibrespotInstance, volume: u16) {
-    unsafe { send_cmd(instance, LibrespotCommand::SetVolume(volume)) };
+    send_cmd(instance, LibrespotCommand::SetVolume(volume));
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn librespot_set_shuffle(instance: *mut LibrespotInstance, enabled: bool) {
-    unsafe { send_cmd(instance, LibrespotCommand::SetShuffle(enabled)) };
+    send_cmd(instance, LibrespotCommand::SetShuffle(enabled));
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn librespot_set_repeat(instance: *mut LibrespotInstance, mode: u32) {
-    unsafe {
-        send_cmd(instance, LibrespotCommand::SetRepeatContext(mode >= 1));
-        send_cmd(instance, LibrespotCommand::SetRepeatTrack(mode == 2));
-    }
+    send_cmd(instance, LibrespotCommand::SetRepeatContext(mode >= 1));
+    send_cmd(instance, LibrespotCommand::SetRepeatTrack(mode == 2));
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn librespot_get_position_ms(instance: *mut LibrespotInstance) -> u32 {
-    if let Some(inst) = unsafe { instance.as_ref() } {
+    let inst = unsafe { instance.as_ref() };
+    if let Some(inst) = inst {
         let state = &inst.state;
 
         let base_ms = state.position_ms.load(Ordering::Acquire);
@@ -188,14 +253,16 @@ pub unsafe extern "C" fn librespot_get_position_ms(instance: *mut LibrespotInsta
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn librespot_get_duration_ms(instance: *mut LibrespotInstance) -> u32 {
-    unsafe { instance.as_ref() }.map_or(0, |i| i.state.duration_ms.load(Ordering::Acquire))
+    let inst = unsafe { instance.as_ref() };
+    inst.map_or(0, |i| i.state.duration_ms.load(Ordering::Acquire))
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn librespot_get_current_track_info(
     instance: *mut LibrespotInstance,
 ) -> TrackMetadata {
-    if let Some(inst) = unsafe { instance.as_ref() } {
+    let inst = unsafe { instance.as_ref() };
+    if let Some(inst) = inst {
         if let Ok(current) = inst.state.current_track.read() {
             if let Some(ref meta) = *current {
                 return TrackMetadata {
@@ -209,5 +276,6 @@ pub unsafe extern "C" fn librespot_get_current_track_info(
             }
         }
     }
+
     unsafe { std::mem::zeroed() }
 }
