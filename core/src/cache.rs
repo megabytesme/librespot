@@ -13,7 +13,9 @@ use std::{
 use priority_queue::PriorityQueue;
 use thiserror::Error;
 
-use crate::{Error, FileId, authentication::Credentials, error::ErrorKind};
+use crate::{
+    Error, FileId, LibrespotKeyRemoveCallback, authentication::Credentials, error::ErrorKind,
+};
 
 const CACHE_LIMITER_POISON_MSG: &str = "cache limiter mutex should not be poisoned";
 
@@ -212,20 +214,42 @@ impl FsSizeLimiter {
             .remove(file)
     }
 
-    fn prune_internal<F: FnMut() -> Option<PathBuf>>(mut pop: F) -> Result<(), Error> {
+    fn prune_internal<F: FnMut() -> Option<PathBuf>>(
+        mut pop: F,
+        remove_callback: Option<LibrespotKeyRemoveCallback>,
+    ) -> Result<(), Error> {
         let mut first = true;
         let mut count = 0;
         let mut last_error = None;
 
-        while let Some(file) = pop() {
+        while let Some(file_path) = pop() {
             if first {
                 debug!("Cache dir exceeds limit, removing least recently used files.");
                 first = false;
             }
 
-            let res = fs::remove_file(&file);
+            if let Some(cb) = remove_callback {
+                if let Some(file_name) = file_path.file_name().and_then(|n| n.to_str()) {
+                    if let Some(parent) = file_path
+                        .parent()
+                        .and_then(|p| p.file_name().and_then(|n| n.to_str()))
+                    {
+                        let full_hex_id = format!("{}{}", parent, file_name);
+
+                        if let Ok(bytes) = (0..full_hex_id.len())
+                            .step_by(2)
+                            .map(|i| u8::from_str_radix(&full_hex_id[i..i + 2], 16))
+                            .collect::<Result<Vec<u8>, _>>()
+                        {
+                            cb(bytes.as_ptr(), std::ptr::null_mut());
+                        }
+                    }
+                }
+            }
+
+            let res = fs::remove_file(&file_path);
             if let Err(e) = res {
-                warn!("Could not remove file {file:?} from cache dir: {e}");
+                warn!("Could not remove file {file_path:?} from cache dir: {e}");
                 last_error = Some(e);
             } else {
                 count += 1;
@@ -243,15 +267,22 @@ impl FsSizeLimiter {
         }
     }
 
-    fn prune(&self) -> Result<(), Error> {
-        Self::prune_internal(|| self.limiter.lock().expect(CACHE_LIMITER_POISON_MSG).pop())
+    fn prune(&self, remove_callback: Option<LibrespotKeyRemoveCallback>) -> Result<(), Error> {
+        Self::prune_internal(
+            || self.limiter.lock().expect(CACHE_LIMITER_POISON_MSG).pop(),
+            remove_callback,
+        )
     }
 
-    fn new(path: &Path, limit: u64) -> Result<Self, Error> {
+    fn new(
+        path: &Path,
+        limit: u64,
+        remove_callback: Option<LibrespotKeyRemoveCallback>,
+    ) -> Result<Self, Error> {
         let mut limiter = SizeLimiter::new(limit);
 
         Self::init_dir(&mut limiter, path);
-        Self::prune_internal(|| limiter.pop())?;
+        Self::prune_internal(|| limiter.pop(), remove_callback)?;
 
         Ok(Self {
             limiter: Mutex::new(limiter),
@@ -266,6 +297,7 @@ pub struct Cache {
     volume_location: Option<PathBuf>,
     audio_location: Option<PathBuf>,
     size_limiter: Option<Arc<FsSizeLimiter>>,
+    remove_callback: Option<LibrespotKeyRemoveCallback>,
 }
 
 impl Cache {
@@ -274,6 +306,7 @@ impl Cache {
         volume_path: Option<P>,
         audio_path: Option<P>,
         size_limit: Option<u64>,
+        remove_callback: Option<LibrespotKeyRemoveCallback>,
     ) -> Result<Self, Error> {
         let mut size_limiter = None;
 
@@ -295,7 +328,7 @@ impl Cache {
             fs::create_dir_all(location)?;
 
             if let Some(limit) = size_limit {
-                let limiter = FsSizeLimiter::new(location.as_ref(), limit)?;
+                let limiter = FsSizeLimiter::new(location.as_ref(), limit, remove_callback)?;
                 size_limiter = Some(Arc::new(limiter));
             }
         }
@@ -307,6 +340,7 @@ impl Cache {
             volume_location,
             audio_location,
             size_limiter,
+            remove_callback,
         };
 
         Ok(cache)
@@ -426,7 +460,7 @@ impl Cache {
                 {
                     if let Some(limiter) = self.size_limiter.as_deref() {
                         limiter.add(&path, size);
-                        limiter.prune()?;
+                        limiter.prune(self.remove_callback)?;
                     }
                     return Ok(path);
                 }
@@ -441,6 +475,17 @@ impl Cache {
         fs::remove_file(&path)?;
         if let Some(limiter) = self.size_limiter.as_deref() {
             limiter.remove(&path);
+        }
+
+        if let Some(cb) = self.remove_callback {
+            let hex_id = file.to_base16();
+            if let Ok(bytes) = (0..hex_id.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex_id[i..i + 2], 16))
+                .collect::<Result<Vec<u8>, _>>()
+            {
+                cb(bytes.as_ptr(), std::ptr::null_mut());
+            }
         }
 
         Ok(())

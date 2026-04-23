@@ -60,6 +60,7 @@ pub struct RunnerSetup {
     pub zeroconf_port: u16,
     pub key_callback: Option<librespot_core::LibrespotKeyCallback>,
     pub key_save_callback: Option<librespot_core::LibrespotKeySaveCallback>,
+    pub key_remove_callback: Option<librespot_core::LibrespotKeyRemoveCallback>,
 }
 
 pub struct TrackMetadataInternal {
@@ -147,6 +148,7 @@ impl Runner {
             Some(self.setup.session_config.tmp_dir.clone()),
             Some(self.setup.session_config.tmp_dir.join("audio")),
             Some(1024 * 1024 * 500),
+            self.setup.key_remove_callback,
         )
         .ok();
 
