@@ -2,6 +2,7 @@
 extern crate log;
 
 use librespot_protocol as protocol;
+use std::ffi::c_void;
 
 #[macro_use]
 mod component;
@@ -44,3 +45,16 @@ pub use file_id::FileId;
 pub use session::Session;
 pub use spotify_id::SpotifyId;
 pub use spotify_uri::SpotifyUri;
+
+#[derive(Clone, Copy)]
+pub struct UserDataPtr(pub *mut std::ffi::c_void);
+
+unsafe impl Send for UserDataPtr {}
+unsafe impl Sync for UserDataPtr {}
+
+pub type LibrespotKeyCallback = extern "C" fn(
+    track_id_ptr: *const u8,
+    file_id_ptr: *const u8,
+    key_out: *mut u8,
+    user_data: *mut c_void,
+) -> bool;

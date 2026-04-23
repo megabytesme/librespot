@@ -16,6 +16,7 @@ pub struct LibrespotConfig {
     pub password: *const c_char,
     pub auth_blob: *const c_char,
     pub access_token: *const c_char,
+    pub key_callback: Option<librespot_core::LibrespotKeyCallback>, // New
 }
 
 #[repr(i32)]

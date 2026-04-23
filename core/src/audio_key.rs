@@ -5,7 +5,12 @@ use bytes::Bytes;
 use thiserror::Error;
 use tokio::sync::oneshot;
 
-use crate::{Error, FileId, SpotifyId, packet::PacketType, util::SeqGenerator};
+use crate::{
+    Error, FileId, LibrespotKeyCallback, SpotifyId, UserDataPtr, packet::PacketType,
+    util::SeqGenerator,
+};
+
+use std::ffi::c_void;
 
 #[derive(Debug, Hash, PartialEq, Eq, Copy, Clone)]
 pub struct AudioKey(pub [u8; 16]);
@@ -40,6 +45,8 @@ component! {
     AudioKeyManager : AudioKeyManagerInner {
         sequence: SeqGenerator<u32> = SeqGenerator::new(0),
         pending: HashMap<u32, oneshot::Sender<Result<AudioKey, Error>>> = HashMap::new(),
+        key_callback: Option<LibrespotKeyCallback> = None,
+        user_data: Option<UserDataPtr> = None,
     }
 }
 
@@ -79,6 +86,38 @@ impl AudioKeyManager {
     }
 
     pub async fn request(&self, track: SpotifyId, file: FileId) -> Result<AudioKey, Error> {
+        let frontend_key = self.lock(|inner| {
+            if let Some(callback) = inner.key_callback {
+                let track_id_str = track.to_base62();
+                trace!(
+                    "Requesting audio key from frontend for track {}",
+                    track_id_str
+                );
+
+                let mut key_buffer = [0u8; 16];
+                let track_bytes = track.to_raw();
+                let file_bytes = file.0;
+
+                let found = callback(
+                    track_bytes.as_ptr(),
+                    file_bytes.as_ptr(),
+                    key_buffer.as_mut_ptr(),
+                    inner.user_data.map(|u| u.0).unwrap_or(std::ptr::null_mut()),
+                );
+
+                if found {
+                    info!("Audio key for track {} provided by frontend", track_id_str);
+                    return Some(AudioKey(key_buffer));
+                }
+            }
+            None
+        });
+
+        if let Some(key) = frontend_key {
+            return Ok(key);
+        }
+
+        trace!("Audio key not found in frontend; requesting from Spotify servers");
         let (tx, rx) = oneshot::channel();
 
         let seq = self.lock(move |inner| {
@@ -88,13 +127,21 @@ impl AudioKeyManager {
         });
 
         self.send_key_request(seq, track, file)?;
+
         const KEY_RESPONSE_TIMEOUT: Duration = Duration::from_millis(1500);
         match tokio::time::timeout(KEY_RESPONSE_TIMEOUT, rx).await {
             Err(_) => {
-                error!("Audio key response timeout");
+                error!("Audio key response timeout for track {}", track.to_base62());
                 Err(AudioKeyError::Timeout.into())
             }
-            Ok(k) => k?,
+            Ok(k) => {
+                let result = k?;
+                trace!(
+                    "Audio key for track {} received from Spotify",
+                    track.to_base62()
+                );
+                result
+            }
         }
     }
 
@@ -106,5 +153,12 @@ impl AudioKeyManager {
         data.write_u16::<BigEndian>(0x0000)?;
 
         self.session().send_packet(PacketType::RequestKey, data)
+    }
+
+    pub fn set_ffi_hooks(&self, callback: Option<LibrespotKeyCallback>, user_data: *mut c_void) {
+        self.lock(|inner| {
+            inner.key_callback = callback;
+            inner.user_data = Some(UserDataPtr(user_data));
+        });
     }
 }
