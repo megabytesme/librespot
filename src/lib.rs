@@ -4,13 +4,18 @@ mod logger;
 mod runner;
 
 use crate::ffi_types::*;
-use crate::runner::{LibrespotCommand, Runner, RunnerState};
+use crate::runner::{
+    AppDataPayload, LibrespotCommand, Runner, RunnerState, alloc_ffi_album, alloc_ffi_artist,
+    alloc_ffi_artist_list, alloc_ffi_playlist, alloc_ffi_playlist_list, alloc_ffi_search,
+    alloc_ffi_track, alloc_ffi_track_list, alloc_ffi_user_profile,
+};
 use librespot_core::{FileId, cache::Cache};
-use std::ffi::{CStr, c_char};
+use std::ffi::{CStr, CString, c_char};
 use std::os::raw::c_void;
 use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use std::sync::atomic::Ordering;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use tokio::sync::mpsc;
 
@@ -25,6 +30,79 @@ pub struct LibrespotInstance {
 struct UserDataWrapper(*mut c_void);
 unsafe impl Send for UserDataWrapper {}
 unsafe impl Sync for UserDataWrapper {}
+
+static LAST_ERROR: OnceLock<Mutex<String>> = OnceLock::new();
+
+fn set_last_error(message: impl Into<String>) {
+    let store = LAST_ERROR.get_or_init(|| Mutex::new(String::new()));
+    if let Ok(mut slot) = store.lock() {
+        *slot = message.into();
+    }
+}
+
+fn clear_last_error() {
+    set_last_error(String::new());
+}
+
+fn request_appdata(
+    instance: *mut LibrespotInstance,
+    kind: i32,
+    argument: *const c_char,
+) -> Result<AppDataPayload, String> {
+    if instance.is_null() || argument.is_null() {
+        let err = "instance or argument pointer was null".to_string();
+        set_last_error(err.clone());
+        return Err(err);
+    }
+
+    let argument = match unsafe { CStr::from_ptr(argument) }.to_str() {
+        Ok(value) if !value.is_empty() => value.to_owned(),
+        _ => {
+            let err = "argument string was invalid or empty".to_string();
+            set_last_error(err.clone());
+            return Err(err);
+        }
+    };
+
+    let (result_tx, result_rx) = std_mpsc::channel();
+    let inst = unsafe { instance.as_ref() };
+    let Some(inst) = inst else {
+        let err = "instance reference was invalid".to_string();
+        set_last_error(err.clone());
+        return Err(err);
+    };
+
+    if inst
+        .cmd_tx
+        .send(LibrespotCommand::GetAppData {
+            kind,
+            argument,
+            result_tx,
+        })
+        .is_err()
+    {
+        let err = "failed to send GetAppData command to runner".to_string();
+        set_last_error(err.clone());
+        return Err(err);
+    }
+
+    match result_rx.recv() {
+        Ok(Ok(payload)) => {
+            clear_last_error();
+            Ok(payload)
+        }
+        Ok(Err(err)) => {
+            set_last_error(err.clone());
+            log::error!("librespot appdata request failed for kind {}: {}", kind, err);
+            Err(err)
+        }
+        Err(err) => {
+            let err = format!("failed to receive GetAppData result: {}", err);
+            set_last_error(err.clone());
+            Err(err)
+        }
+    }
+}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn librespot_new(
@@ -177,6 +255,345 @@ pub unsafe extern "C" fn librespot_track_set_persisted(
     }
 
     result_rx.recv().unwrap_or(false)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn librespot_appdata_get(
+    instance: *mut LibrespotInstance,
+    kind: i32,
+    argument: *const c_char,
+) -> *mut c_char {
+    match request_appdata(instance, kind, argument) {
+        Ok(payload) => {
+            let json = match serde_json::to_string(&payload) {
+                Ok(json) => json,
+                Err(err) => {
+                    set_last_error(format!("failed to serialize appdata payload: {}", err));
+                    return std::ptr::null_mut();
+                }
+            };
+            clear_last_error();
+            CString::new(json)
+                .map(CString::into_raw)
+                .unwrap_or_else(|err| {
+                    set_last_error(format!("failed to marshal json as C string: {}", err));
+                    std::ptr::null_mut()
+                })
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+macro_rules! appdata_typed_get {
+    ($name:ident, $kind:expr, $variant:path, $alloc:ident, $ret:ty) => {
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $name(
+            instance: *mut LibrespotInstance,
+            argument: *const c_char,
+        ) -> *mut $ret {
+            match request_appdata(instance, $kind, argument) {
+                Ok(payload) => match payload {
+                    $variant(inner) => $alloc(inner),
+                    _ => {
+                        set_last_error("received unexpected appdata payload variant");
+                        std::ptr::null_mut()
+                    }
+                },
+                Err(_) => std::ptr::null_mut(),
+            }
+        }
+    };
+}
+
+appdata_typed_get!(librespot_track_get, 1, AppDataPayload::Track, alloc_ffi_track, FfiTrack);
+appdata_typed_get!(librespot_album_get, 2, AppDataPayload::Album, alloc_ffi_album, FfiAlbum);
+appdata_typed_get!(librespot_artist_get, 3, AppDataPayload::Artist, alloc_ffi_artist, FfiArtist);
+appdata_typed_get!(
+    librespot_playlist_get,
+    4,
+    AppDataPayload::Playlist,
+    alloc_ffi_playlist,
+    FfiPlaylist
+);
+appdata_typed_get!(
+    librespot_user_profile_get,
+    5,
+    AppDataPayload::UserProfile,
+    alloc_ffi_user_profile,
+    FfiUserProfile
+);
+appdata_typed_get!(
+    librespot_user_playlists_get,
+    6,
+    AppDataPayload::UserPlaylists,
+    alloc_ffi_playlist_list,
+    FfiPlaylistList
+);
+appdata_typed_get!(
+    librespot_saved_tracks_get,
+    7,
+    AppDataPayload::SavedTracks,
+    alloc_ffi_track_list,
+    FfiTrackList
+);
+appdata_typed_get!(librespot_search_get, 8, AppDataPayload::Search, alloc_ffi_search, FfiSearch);
+appdata_typed_get!(
+    librespot_followed_artists_get,
+    9,
+    AppDataPayload::FollowedArtists,
+    alloc_ffi_artist_list,
+    FfiArtistList
+);
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn librespot_last_error_get() -> *mut c_char {
+    let store = LAST_ERROR.get_or_init(|| Mutex::new(String::new()));
+    let message = store
+        .lock()
+        .map(|slot| slot.clone())
+        .unwrap_or_else(|_| "failed to lock last error store".to_string());
+
+    CString::new(message)
+        .map(CString::into_raw)
+        .unwrap_or(std::ptr::null_mut())
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn librespot_string_free(value: *mut c_char) {
+    if !value.is_null() {
+        let _ = unsafe { CString::from_raw(value) };
+    }
+}
+
+unsafe fn free_c_string(value: *mut c_char) {
+    if !value.is_null() {
+        let _ = CString::from_raw(value);
+    }
+}
+
+unsafe fn free_boxed_slice<T>(ptr: *mut T, len: usize) {
+    if !ptr.is_null() {
+        let raw = std::ptr::slice_from_raw_parts_mut(ptr, len);
+        let _ = Box::from_raw(raw);
+    }
+}
+
+unsafe fn free_images(ptr: *mut FfiImage, len: usize) {
+    if ptr.is_null() {
+        return;
+    }
+    let slice = std::slice::from_raw_parts_mut(ptr, len);
+    for item in slice {
+        free_c_string(item.url);
+    }
+    free_boxed_slice(ptr, len);
+}
+
+unsafe fn free_artist_summaries(ptr: *mut FfiArtistSummary, len: usize) {
+    if ptr.is_null() {
+        return;
+    }
+    let slice = std::slice::from_raw_parts_mut(ptr, len);
+    for item in slice {
+        free_c_string(item.id);
+        free_c_string(item.uri);
+        free_c_string(item.name);
+    }
+    free_boxed_slice(ptr, len);
+}
+
+unsafe fn free_album_summary(ptr: *mut FfiAlbumSummary) {
+    if ptr.is_null() {
+        return;
+    }
+    let item = &mut *ptr;
+    free_c_string(item.id);
+    free_c_string(item.uri);
+    free_c_string(item.name);
+    free_c_string(item.album_type);
+    free_c_string(item.release_date);
+    free_images(item.images, item.image_count);
+    free_artist_summaries(item.artists, item.artist_count);
+    let _ = Box::from_raw(ptr);
+}
+
+unsafe fn free_album_summaries(ptr: *mut FfiAlbumSummary, len: usize) {
+    if ptr.is_null() {
+        return;
+    }
+    let slice = std::slice::from_raw_parts_mut(ptr, len);
+    for item in slice {
+        free_c_string(item.id);
+        free_c_string(item.uri);
+        free_c_string(item.name);
+        free_c_string(item.album_type);
+        free_c_string(item.release_date);
+        free_images(item.images, item.image_count);
+        free_artist_summaries(item.artists, item.artist_count);
+    }
+    free_boxed_slice(ptr, len);
+}
+
+unsafe fn free_simple_tracks(ptr: *mut FfiSimpleTrack, len: usize) {
+    if ptr.is_null() {
+        return;
+    }
+    let slice = std::slice::from_raw_parts_mut(ptr, len);
+    for item in slice {
+        free_c_string(item.id);
+        free_c_string(item.uri);
+        free_c_string(item.name);
+        free_artist_summaries(item.artists, item.artist_count);
+    }
+    free_boxed_slice(ptr, len);
+}
+
+unsafe fn free_tracks(ptr: *mut FfiTrack, len: usize) {
+    if ptr.is_null() {
+        return;
+    }
+    let slice = std::slice::from_raw_parts_mut(ptr, len);
+    for item in slice {
+        free_c_string(item.id);
+        free_c_string(item.uri);
+        free_c_string(item.name);
+        free_artist_summaries(item.artists, item.artist_count);
+        free_album_summary(item.album);
+    }
+    free_boxed_slice(ptr, len);
+}
+
+unsafe fn free_owner(ptr: *mut FfiOwner) {
+    if ptr.is_null() {
+        return;
+    }
+    let item = &mut *ptr;
+    free_c_string(item.id);
+    free_c_string(item.display_name);
+    let _ = Box::from_raw(ptr);
+}
+
+unsafe fn free_playlist_summaries(ptr: *mut FfiPlaylistSummary, len: usize) {
+    if ptr.is_null() {
+        return;
+    }
+    let slice = std::slice::from_raw_parts_mut(ptr, len);
+    for item in slice {
+        free_c_string(item.id);
+        free_c_string(item.uri);
+        free_c_string(item.name);
+        free_images(item.images, item.image_count);
+    }
+    free_boxed_slice(ptr, len);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn librespot_track_free(value: *mut FfiTrack) {
+    free_tracks(value, 1);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn librespot_album_free(value: *mut FfiAlbum) {
+    if value.is_null() {
+        return;
+    }
+    let item = &mut *value;
+    free_c_string(item.id);
+    free_c_string(item.uri);
+    free_c_string(item.name);
+    free_c_string(item.album_type);
+    free_c_string(item.release_date);
+    free_images(item.images, item.image_count);
+    free_artist_summaries(item.artists, item.artist_count);
+    free_simple_tracks(item.tracks, item.track_count);
+    let _ = Box::from_raw(value);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn librespot_artist_free(value: *mut FfiArtist) {
+    if value.is_null() {
+        return;
+    }
+    let item = &mut *value;
+    free_c_string(item.id);
+    free_c_string(item.uri);
+    free_c_string(item.name);
+    free_images(item.images, item.image_count);
+    free_album_summaries(item.albums, item.album_count);
+    let _ = Box::from_raw(value);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn librespot_playlist_free(value: *mut FfiPlaylist) {
+    if value.is_null() {
+        return;
+    }
+    let item = &mut *value;
+    free_c_string(item.id);
+    free_c_string(item.uri);
+    free_c_string(item.name);
+    free_images(item.images, item.image_count);
+    free_owner(item.owner);
+    free_tracks(item.tracks, item.track_count);
+    let _ = Box::from_raw(value);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn librespot_user_profile_free(value: *mut FfiUserProfile) {
+    if value.is_null() {
+        return;
+    }
+    let item = &mut *value;
+    free_c_string(item.id);
+    free_c_string(item.uri);
+    free_c_string(item.display_name);
+    free_c_string(item.email);
+    free_c_string(item.country);
+    free_images(item.images, item.image_count);
+    let _ = Box::from_raw(value);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn librespot_playlist_list_free(value: *mut FfiPlaylistList) {
+    if value.is_null() {
+        return;
+    }
+    let item = &mut *value;
+    free_playlist_summaries(item.items, item.item_count);
+    let _ = Box::from_raw(value);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn librespot_track_list_free(value: *mut FfiTrackList) {
+    if value.is_null() {
+        return;
+    }
+    let item = &mut *value;
+    free_tracks(item.items, item.item_count);
+    let _ = Box::from_raw(value);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn librespot_artist_list_free(value: *mut FfiArtistList) {
+    if value.is_null() {
+        return;
+    }
+    let item = &mut *value;
+    free_artist_summaries(item.items, item.item_count);
+    let _ = Box::from_raw(value);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn librespot_search_free(value: *mut FfiSearch) {
+    if value.is_null() {
+        return;
+    }
+    let item = &mut *value;
+    free_tracks(item.tracks, item.track_count);
+    free_album_summaries(item.albums, item.album_count);
+    free_artist_summaries(item.artists, item.artist_count);
+    free_playlist_summaries(item.playlists, item.playlist_count);
+    let _ = Box::from_raw(value);
 }
 
 #[unsafe(no_mangle)]

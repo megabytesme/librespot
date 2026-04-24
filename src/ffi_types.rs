@@ -107,3 +107,151 @@ pub struct LibrespotEvent {
 }
 
 pub type LibrespotCallback = extern "C" fn(*const LibrespotEvent, *mut c_void);
+
+#[repr(C)]
+pub struct FfiImage {
+    pub url: *mut c_char,
+    pub width: i32,
+    pub height: i32,
+}
+
+#[repr(C)]
+pub struct FfiArtistSummary {
+    pub id: *mut c_char,
+    pub uri: *mut c_char,
+    pub name: *mut c_char,
+}
+
+#[repr(C)]
+pub struct FfiAlbumSummary {
+    pub id: *mut c_char,
+    pub uri: *mut c_char,
+    pub name: *mut c_char,
+    pub album_type: *mut c_char,
+    pub release_date: *mut c_char,
+    pub total_tracks: i32,
+    pub images: *mut FfiImage,
+    pub image_count: usize,
+    pub artists: *mut FfiArtistSummary,
+    pub artist_count: usize,
+}
+
+#[repr(C)]
+pub struct FfiSimpleTrack {
+    pub id: *mut c_char,
+    pub uri: *mut c_char,
+    pub name: *mut c_char,
+    pub duration_ms: i32,
+    pub disc_number: i32,
+    pub track_number: i32,
+    pub artists: *mut FfiArtistSummary,
+    pub artist_count: usize,
+}
+
+#[repr(C)]
+pub struct FfiTrack {
+    pub id: *mut c_char,
+    pub uri: *mut c_char,
+    pub name: *mut c_char,
+    pub duration_ms: i32,
+    pub disc_number: i32,
+    pub track_number: i32,
+    pub artists: *mut FfiArtistSummary,
+    pub artist_count: usize,
+    pub album: *mut FfiAlbumSummary,
+}
+
+#[repr(C)]
+pub struct FfiAlbum {
+    pub id: *mut c_char,
+    pub uri: *mut c_char,
+    pub name: *mut c_char,
+    pub album_type: *mut c_char,
+    pub release_date: *mut c_char,
+    pub total_tracks: i32,
+    pub images: *mut FfiImage,
+    pub image_count: usize,
+    pub artists: *mut FfiArtistSummary,
+    pub artist_count: usize,
+    pub tracks: *mut FfiSimpleTrack,
+    pub track_count: usize,
+}
+
+#[repr(C)]
+pub struct FfiArtist {
+    pub id: *mut c_char,
+    pub uri: *mut c_char,
+    pub name: *mut c_char,
+    pub images: *mut FfiImage,
+    pub image_count: usize,
+    pub albums: *mut FfiAlbumSummary,
+    pub album_count: usize,
+}
+
+#[repr(C)]
+pub struct FfiOwner {
+    pub id: *mut c_char,
+    pub display_name: *mut c_char,
+}
+
+#[repr(C)]
+pub struct FfiPlaylistSummary {
+    pub id: *mut c_char,
+    pub uri: *mut c_char,
+    pub name: *mut c_char,
+    pub images: *mut FfiImage,
+    pub image_count: usize,
+}
+
+#[repr(C)]
+pub struct FfiPlaylist {
+    pub id: *mut c_char,
+    pub uri: *mut c_char,
+    pub name: *mut c_char,
+    pub images: *mut FfiImage,
+    pub image_count: usize,
+    pub owner: *mut FfiOwner,
+    pub tracks: *mut FfiTrack,
+    pub track_count: usize,
+}
+
+#[repr(C)]
+pub struct FfiUserProfile {
+    pub id: *mut c_char,
+    pub uri: *mut c_char,
+    pub display_name: *mut c_char,
+    pub email: *mut c_char,
+    pub country: *mut c_char,
+    pub images: *mut FfiImage,
+    pub image_count: usize,
+}
+
+#[repr(C)]
+pub struct FfiPlaylistList {
+    pub items: *mut FfiPlaylistSummary,
+    pub item_count: usize,
+}
+
+#[repr(C)]
+pub struct FfiTrackList {
+    pub items: *mut FfiTrack,
+    pub item_count: usize,
+}
+
+#[repr(C)]
+pub struct FfiArtistList {
+    pub items: *mut FfiArtistSummary,
+    pub item_count: usize,
+}
+
+#[repr(C)]
+pub struct FfiSearch {
+    pub tracks: *mut FfiTrack,
+    pub track_count: usize,
+    pub albums: *mut FfiAlbumSummary,
+    pub album_count: usize,
+    pub artists: *mut FfiArtistSummary,
+    pub artist_count: usize,
+    pub playlists: *mut FfiPlaylistSummary,
+    pub playlist_count: usize,
+}

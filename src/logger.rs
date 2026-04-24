@@ -16,8 +16,12 @@ impl log::Log for SimpleLogger {
         if self.enabled(record.metadata()) {
             unsafe {
                 if let Some(cb) = GLOBAL_CB {
-                    let msg = format!("{} - {}", record.level(), record.args());
-                    let c_msg = CString::new(msg).unwrap();
+                    let msg = format!("{} - {}", record.level(), record.args())
+                        .replace('\0', "\\0");
+                    let c_msg = match CString::new(msg) {
+                        Ok(value) => value,
+                        Err(_) => return,
+                    };
 
                     let mut data: EventData = std::mem::zeroed();
                     data.log_msg = c_msg.as_ptr();

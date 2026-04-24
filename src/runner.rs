@@ -1,4 +1,5 @@
 use crate::{UserDataWrapper, ffi_types::*};
+use base64::Engine;
 use futures_util::StreamExt;
 use librespot_audio::Range;
 use librespot_connect::{
@@ -6,8 +7,16 @@ use librespot_connect::{
     Spirc,
 };
 use librespot_core::{
-    FileId, Session, SessionConfig, SpotifyUri, authentication::Credentials, cache::Cache,
-    config::DeviceType,
+    FileId, Session, SessionConfig, SpotifyId, SpotifyUri, authentication::Credentials,
+    cache::Cache, config::DeviceType,
+};
+use librespot_metadata::{
+    Album as LibrespotAlbum, Artist as LibrespotArtist, Episode as LibrespotEpisode,
+    Lyrics as LibrespotLyrics, Metadata, Playlist as LibrespotPlaylist, Show as LibrespotShow,
+    Track as LibrespotTrack, playlist::annotation::PlaylistAnnotation as LibrespotPlaylistAnnotation,
+};
+use librespot_protocol::{
+    autoplay_context_request::AutoplayContextRequest, context::Context,
 };
 use librespot_discovery::Discovery;
 use librespot_metadata::audio::{AudioFileFormat, AudioItem};
@@ -23,7 +32,7 @@ use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, atomic::AtomicU8};
-use std::{ffi::CString, path::PathBuf, sync::atomic::AtomicUsize};
+use std::{ffi::{CString, c_char}, path::PathBuf, sync::atomic::AtomicUsize};
 use std::{mem::ManuallyDrop, pin::Pin};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant, sleep, sleep_until};
@@ -54,6 +63,11 @@ pub enum LibrespotCommand {
         track_uri: String,
         persisted: bool,
         result_tx: std_mpsc::Sender<bool>,
+    },
+    GetAppData {
+        kind: i32,
+        argument: String,
+        result_tx: std_mpsc::Sender<Result<AppDataPayload, String>>,
     },
     Stop,
 }
@@ -363,6 +377,13 @@ impl Runner {
                                 );
                             }
                             let _ = result_tx.send(result.is_ok());
+                        }
+                        LibrespotCommand::GetAppData { kind, argument, result_tx } => {
+                            let result = self
+                                .get_app_data(&session, kind, &argument)
+                                .await
+                                .map_err(|err| err.to_string());
+                            let _ = result_tx.send(result);
                         }
                         LibrespotCommand::StartDiscovery => {
                             if discovery.is_none() {
@@ -873,6 +894,1891 @@ impl Runner {
             "timed out waiting for cached track file",
         ))
     }
+
+    async fn get_app_data(
+        &self,
+        session: &Session,
+        kind: i32,
+        argument: &str,
+    ) -> Result<AppDataPayload, librespot_core::Error> {
+        let payload = match kind {
+            1 => AppDataPayload::Track(self.fetch_track_payload(session, argument).await?),
+            2 => AppDataPayload::Album(self.fetch_album_payload(session, argument).await?),
+            3 => AppDataPayload::Artist(self.fetch_artist_payload(session, argument).await?),
+            4 => AppDataPayload::Playlist(self.fetch_playlist_payload(session, argument).await?),
+            5 => AppDataPayload::UserProfile(
+                self.fetch_user_profile_payload(session, argument).await?,
+            ),
+            6 => AppDataPayload::UserPlaylists(
+                self.fetch_user_playlists_payload(session, argument).await?,
+            ),
+            7 => AppDataPayload::SavedTracks(
+                self.fetch_saved_tracks_payload(session, argument).await?,
+            ),
+            8 => AppDataPayload::Search(self.fetch_search_payload(session, argument).await?),
+            9 => AppDataPayload::FollowedArtists(
+                self.fetch_followed_artists_payload(session, argument).await?,
+            ),
+            10 => AppDataPayload::Lyrics(self.fetch_lyrics_payload(session, argument).await?),
+            11 => AppDataPayload::LyricsForImage(
+                self.fetch_lyrics_for_image_payload(session, argument).await?,
+            ),
+            12 => AppDataPayload::Episode(self.fetch_episode_payload(session, argument).await?),
+            13 => AppDataPayload::Show(self.fetch_show_payload(session, argument).await?),
+            14 => AppDataPayload::PlaylistAnnotation(
+                self.fetch_playlist_annotation_payload(session, argument).await?,
+            ),
+            15 => AppDataPayload::UserFollowersJson(
+                self.fetch_user_followers_json_payload(session, argument).await?,
+            ),
+            16 => AppDataPayload::UserFollowingJson(
+                self.fetch_user_following_json_payload(session, argument).await?,
+            ),
+            17 => AppDataPayload::RadioForTrackJson(
+                self.fetch_radio_for_track_payload(session, argument).await?,
+            ),
+            18 => AppDataPayload::ApolloStationJson(
+                self.fetch_apollo_station_payload(session, argument).await?,
+            ),
+            19 => AppDataPayload::NextPageJson(self.fetch_next_page_payload(session, argument).await?),
+            20 => AppDataPayload::AudioStorageJson(
+                self.fetch_audio_storage_payload(session, argument).await?,
+            ),
+            21 => AppDataPayload::AudioPreviewBinary(
+                self.fetch_audio_preview_payload(session, argument).await?,
+            ),
+            22 => AppDataPayload::HeadFileBinary(
+                self.fetch_head_file_payload(session, argument).await?,
+            ),
+            23 => AppDataPayload::ImageBinary(self.fetch_image_payload(session, argument).await?),
+            24 => AppDataPayload::ContextJson(self.fetch_context_payload(session, argument).await?),
+            25 => AppDataPayload::AutoplayContextJson(
+                self.fetch_autoplay_context_payload(session, argument).await?,
+            ),
+            26 => AppDataPayload::RootlistJson(self.fetch_rootlist_payload(session, argument).await?),
+            _ => {
+                return Err(librespot_core::Error::invalid_argument(
+                    "unknown app data request kind",
+                ));
+            }
+        };
+        Ok(payload)
+    }
+
+    async fn fetch_track_payload(
+        &self,
+        session: &Session,
+        track_uri: &str,
+    ) -> Result<TrackPayload, librespot_core::Error> {
+        let uri = SpotifyUri::from_uri(track_uri)?;
+        let track = LibrespotTrack::get(session, &uri).await?;
+        let album = self.fetch_album_summary_by_uri(session, &track.album.id.to_uri()).await?;
+        Ok(self.map_track_payload(&track, album))
+    }
+
+    async fn fetch_album_payload(
+        &self,
+        session: &Session,
+        album_uri: &str,
+    ) -> Result<AlbumPayload, librespot_core::Error> {
+        let uri = SpotifyUri::from_uri(album_uri)?;
+        let album = LibrespotAlbum::get(session, &uri).await?;
+        let mut tracks = Vec::new();
+
+        for track_uri in album.tracks() {
+            match LibrespotTrack::get(session, track_uri).await {
+                Ok(track) => tracks.push(self.map_simple_track_payload(&track)),
+                Err(err) => log::warn!(
+                    "Skipping album track {} for {}: {}",
+                    track_uri.to_uri(),
+                    album_uri,
+                    err
+                ),
+            }
+        }
+
+        Ok(AlbumPayload {
+            id: album.id.to_id(),
+            uri: album.id.to_uri(),
+            name: album.name,
+            album_type: format!("{:?}", album.album_type).to_lowercase(),
+            images: self.map_images(session, &album.covers),
+            artists: self.map_artists(&album.artists),
+            release_date: self.format_date(&album.date),
+            total_tracks: tracks.len() as i32,
+            tracks,
+        })
+    }
+
+    async fn fetch_artist_payload(
+        &self,
+        session: &Session,
+        artist_uri: &str,
+    ) -> Result<ArtistPayload, librespot_core::Error> {
+        let uri = SpotifyUri::from_uri(artist_uri)?;
+        let artist = LibrespotArtist::get(session, &uri).await?;
+
+        let mut albums = Vec::new();
+        for album_uri in artist.albums_current() {
+            match self
+                .fetch_album_summary_by_uri(session, &album_uri.to_uri())
+                .await
+            {
+                Ok(album) => albums.push(album),
+                Err(err) => log::warn!(
+                    "Skipping artist album {} for {}: {}",
+                    album_uri.to_uri(),
+                    artist_uri,
+                    err
+                ),
+            }
+        }
+
+        Ok(ArtistPayload {
+            id: artist.id.to_id(),
+            uri: artist.id.to_uri(),
+            name: artist.name,
+            images: self.map_images(session, &artist.portraits),
+            albums,
+        })
+    }
+
+    async fn fetch_playlist_payload(
+        &self,
+        session: &Session,
+        playlist_uri: &str,
+    ) -> Result<PlaylistPayload, librespot_core::Error> {
+        let uri = SpotifyUri::from_uri(playlist_uri)?;
+        let playlist = LibrespotPlaylist::get(session, &uri).await?;
+        let mut items = Vec::new();
+
+        for item in playlist.contents.items.iter() {
+            if matches!(item.id, SpotifyUri::Track { .. }) {
+                match LibrespotTrack::get(session, &item.id).await {
+                    Ok(track) => match self
+                        .fetch_album_summary_by_uri(session, &track.album.id.to_uri())
+                        .await
+                    {
+                        Ok(album) => items.push(PlaylistTrackPayload {
+                            track: self.map_track_payload(&track, album),
+                        }),
+                        Err(err) => log::warn!(
+                            "Skipping playlist track album {} for {}: {}",
+                            track.album.id.to_uri(),
+                            playlist_uri,
+                            err
+                        ),
+                    },
+                    Err(err) => log::warn!(
+                        "Skipping playlist track {} for {}: {}",
+                        item.id.to_uri(),
+                        playlist_uri,
+                        err
+                    ),
+                }
+            }
+        }
+
+        let image_url = playlist
+            .attributes
+            .picture_sizes
+            .first()
+            .map(|picture| picture.url.clone())
+            .unwrap_or_default();
+
+        Ok(PlaylistPayload {
+            id: playlist.id.to_id(),
+            uri: playlist.id.to_uri(),
+            name: playlist.attributes.name,
+            images: if image_url.is_empty() {
+                Vec::new()
+            } else {
+                vec![ImagePayload {
+                    url: image_url,
+                    width: 0,
+                    height: 0,
+                }]
+            },
+            owner: OwnerPayload {
+                id: match &playlist.id {
+                    SpotifyUri::Playlist { user, .. } => user.clone().unwrap_or_default(),
+                    _ => String::new(),
+                },
+                display_name: match &playlist.id {
+                    SpotifyUri::Playlist { user, .. } => user.clone().unwrap_or_default(),
+                    _ => String::new(),
+                },
+            },
+            tracks: items,
+        })
+    }
+
+    async fn fetch_album_summary_by_uri(
+        &self,
+        session: &Session,
+        album_uri: &str,
+    ) -> Result<AlbumSummaryPayload, librespot_core::Error> {
+        let uri = SpotifyUri::from_uri(album_uri)?;
+        let album = LibrespotAlbum::get(session, &uri).await?;
+        Ok(AlbumSummaryPayload {
+            id: album.id.to_id(),
+            uri: album.id.to_uri(),
+            name: album.name,
+            album_type: format!("{:?}", album.album_type).to_lowercase(),
+            images: self.map_images(session, &album.covers),
+            artists: self.map_artists(&album.artists),
+        })
+    }
+
+    fn map_track_payload(&self, track: &LibrespotTrack, album: AlbumSummaryPayload) -> TrackPayload {
+        TrackPayload {
+            id: track.id.to_id(),
+            uri: track.id.to_uri(),
+            name: track.name.clone(),
+            duration_ms: track.duration,
+            disc_number: track.disc_number,
+            track_number: track.number,
+            artists: self.map_artists(&track.artists),
+            album,
+        }
+    }
+
+    fn map_simple_track_payload(&self, track: &LibrespotTrack) -> SimpleTrackPayload {
+        SimpleTrackPayload {
+            id: track.id.to_id(),
+            uri: track.id.to_uri(),
+            name: track.name.clone(),
+            duration_ms: track.duration,
+            disc_number: track.disc_number,
+            track_number: track.number,
+            artists: self.map_artists(&track.artists),
+        }
+    }
+
+    fn map_artists(
+        &self,
+        artists: &librespot_metadata::artist::Artists,
+    ) -> Vec<ArtistSummaryPayload> {
+        artists
+            .iter()
+            .map(|artist| ArtistSummaryPayload {
+                id: artist.id.to_id(),
+                uri: artist.id.to_uri(),
+                name: artist.name.clone(),
+            })
+            .collect()
+    }
+
+    fn map_images(
+        &self,
+        session: &Session,
+        images: &librespot_metadata::image::Images,
+    ) -> Vec<ImagePayload> {
+        images
+            .iter()
+            .filter_map(|image| {
+                self.image_url_for(session, &image.id).map(|url| ImagePayload {
+                    url,
+                    width: image.width,
+                    height: image.height,
+                })
+            })
+            .collect()
+    }
+
+    fn image_url_for(&self, session: &Session, file_id: &FileId) -> Option<String> {
+        session
+            .get_user_attribute("image-url")
+            .map(|template| template.replace("{file_id}", &file_id.to_base16()))
+    }
+
+    fn format_date(&self, date: &librespot_core::date::Date) -> String {
+        format!(
+            "{:04}-{:02}-{:02}",
+            date.year(),
+            u8::from(date.month()),
+            date.day()
+        )
+    }
+
+    async fn fetch_user_profile_payload(
+        &self,
+        session: &Session,
+        argument: &str,
+    ) -> Result<UserProfilePayload, librespot_core::Error> {
+        let username = self.resolve_username(session, argument)?;
+        let bytes = session
+            .spclient()
+            .get_user_profile(&username, Some(20), Some(20))
+            .await?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|err| librespot_core::Error::failed_precondition(err.to_string()))?;
+
+        let display_name = Self::json_string(&value, &["name", "display_name"])
+            .unwrap_or_else(|| username.clone());
+        let image_url = Self::find_first_image_url(&value);
+
+        Ok(UserProfilePayload {
+            id: username.clone(),
+            uri: format!("spotify:user:{username}"),
+            display_name,
+            email: String::new(),
+            country: session.country(),
+            images: if let Some(url) = image_url {
+                vec![ImagePayload {
+                    url,
+                    width: 0,
+                    height: 0,
+                }]
+            } else {
+                Vec::new()
+            },
+        })
+    }
+
+    async fn fetch_user_playlists_payload(
+        &self,
+        session: &Session,
+        argument: &str,
+    ) -> Result<PlaylistListPayload, librespot_core::Error> {
+        let username = self.resolve_username(session, argument)?;
+        match self
+            .fetch_user_playlists_from_rootlist(session, &username)
+            .await
+        {
+            Ok(payload) if !payload.items.is_empty() => Ok(payload),
+            Ok(_) => {
+                log::warn!(
+                    "Rootlist returned no playlists for <{}>; falling back to profile playlist discovery",
+                    username
+                );
+                self.fetch_user_playlists_from_profile(session, &username).await
+            }
+            Err(err) => {
+                log::warn!(
+                    "Rootlist playlist discovery failed for <{}>: {}. Falling back to profile playlist discovery",
+                    username,
+                    err
+                );
+                self.fetch_user_playlists_from_profile(session, &username).await
+            }
+        }
+    }
+
+    async fn fetch_user_playlists_from_rootlist(
+        &self,
+        session: &Session,
+        username: &str,
+    ) -> Result<PlaylistListPayload, librespot_core::Error> {
+        let bytes = session
+            .spclient()
+            .get_rootlist_for_user(username, 0, Some(200))
+            .await?;
+        self.map_playlist_list_payload_from_bytes(session, &bytes, 200).await
+    }
+
+    async fn fetch_user_playlists_from_profile(
+        &self,
+        session: &Session,
+        username: &str,
+    ) -> Result<PlaylistListPayload, librespot_core::Error> {
+        let bytes = session
+            .spclient()
+            .get_user_profile(username, Some(200), None)
+            .await?;
+        self.map_playlist_list_payload_from_bytes(session, &bytes, 200).await
+    }
+
+    async fn map_playlist_list_payload_from_bytes(
+        &self,
+        session: &Session,
+        bytes: &[u8],
+        limit: usize,
+    ) -> Result<PlaylistListPayload, librespot_core::Error> {
+        let mut uris = match serde_json::from_slice::<serde_json::Value>(bytes) {
+            Ok(value) => {
+                let mut uris = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+                Self::collect_json_spotify_uris_in_order(
+                    &value,
+                    "spotify:playlist:",
+                    &mut uris,
+                    &mut seen,
+                );
+                uris
+            }
+            Err(err) => {
+                let preview = String::from_utf8_lossy(bytes)
+                    .chars()
+                    .take(240)
+                    .collect::<String>()
+                    .replace('\r', "\\r")
+                    .replace('\n', "\\n");
+                log::warn!("Failed to parse playlist list payload. Preview: {}", preview);
+                Self::extract_spotify_uris_from_bytes(bytes, "spotify:playlist:")
+            }
+        };
+
+        if uris.is_empty() {
+            return Err(librespot_core::Error::failed_precondition(
+                "no playlist uris found in playlist list payload",
+            ));
+        }
+
+        let mut playlists = Vec::new();
+        for uri in uris.into_iter().take(limit) {
+            match self.fetch_playlist_payload(session, &uri).await {
+                Ok(playlist) => playlists.push(PlaylistSummaryPayload {
+                    id: playlist.id,
+                    uri: playlist.uri,
+                    name: playlist.name,
+                    images: playlist.images,
+                }),
+                Err(err) => log::warn!("Skipping user playlist {}: {}", uri, err),
+            }
+        }
+
+        Ok(PlaylistListPayload { items: playlists })
+    }
+
+    async fn fetch_saved_tracks_payload(
+        &self,
+        session: &Session,
+        argument: &str,
+    ) -> Result<TrackListPayload, librespot_core::Error> {
+        let username = self.resolve_username(session, argument)?;
+        let context = session
+            .spclient()
+            .get_context(&format!("spotify:user:{username}:collection"))
+            .await?;
+
+        let track_uris = self.collect_context_uris(&context, "track");
+        let mut items = Vec::new();
+        for uri in track_uris {
+            match self.fetch_track_payload(session, &uri).await {
+                Ok(payload) => items.push(payload),
+                Err(err) => log::warn!("Skipping saved track {}: {}", uri, err),
+            }
+        }
+
+        Ok(TrackListPayload { items })
+    }
+
+    async fn fetch_search_payload(
+        &self,
+        session: &Session,
+        query: &str,
+    ) -> Result<SearchPayload, librespot_core::Error> {
+        let search_uri = format!("spotify:search:{}", query.replace(' ', "+"));
+        let context = session.spclient().get_context(&search_uri).await?;
+
+        let track_uris = self.collect_context_uris(&context, "track");
+        let album_uris = self.collect_context_uris(&context, "album");
+        let artist_uris = self.collect_context_uris(&context, "artist");
+        let playlist_uris = self.collect_context_uris(&context, "playlist");
+
+        let mut tracks = Vec::new();
+        for uri in track_uris.into_iter().take(20) {
+            tracks.push(self.fetch_track_payload(session, &uri).await?);
+        }
+
+        let mut albums = Vec::new();
+        for uri in album_uris.into_iter().take(20) {
+            albums.push(self.fetch_album_summary_by_uri(session, &uri).await?);
+        }
+
+        let mut artists = Vec::new();
+        for uri in artist_uris.into_iter().take(20) {
+            let artist = self.fetch_artist_payload(session, &uri).await?;
+            artists.push(ArtistSummaryPayload {
+                id: artist.id,
+                uri: artist.uri,
+                name: artist.name,
+            });
+        }
+
+        let mut playlists = Vec::new();
+        for uri in playlist_uris.into_iter().take(20) {
+            let playlist = self.fetch_playlist_payload(session, &uri).await?;
+            playlists.push(PlaylistSummaryPayload {
+                id: playlist.id,
+                uri: playlist.uri,
+                name: playlist.name,
+                images: playlist.images,
+            });
+        }
+
+        Ok(SearchPayload {
+            tracks,
+            albums,
+            artists,
+            playlists,
+        })
+    }
+
+    async fn fetch_followed_artists_payload(
+        &self,
+        session: &Session,
+        argument: &str,
+    ) -> Result<ArtistListPayload, librespot_core::Error> {
+        let username = self.resolve_username(session, argument)?;
+        let bytes = session.spclient().get_user_following(&username).await?;
+        let mut uris = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(value) => {
+                let mut uris = Vec::new();
+                Self::collect_json_spotify_uris(&value, "spotify:artist:", &mut uris);
+                uris.sort();
+                uris.dedup();
+                uris
+            }
+            Err(err) => {
+                let preview = String::from_utf8_lossy(bytes.as_ref())
+                    .chars()
+                    .take(240)
+                    .collect::<String>()
+                    .replace('\r', "\\r")
+                    .replace('\n', "\\n");
+                log::warn!("Failed to parse followed artists payload. Preview: {}", preview);
+                Self::extract_spotify_uris_from_bytes(bytes.as_ref(), "spotify:artist:")
+            }
+        };
+
+        if uris.is_empty() {
+            return Err(librespot_core::Error::failed_precondition(
+                "no artist uris found in followed artists payload",
+            ));
+        }
+
+        let mut items = Vec::new();
+        for uri in uris.into_iter().take(50) {
+            match self.fetch_artist_payload(session, &uri).await {
+                Ok(artist) => items.push(ArtistSummaryPayload {
+                    id: artist.id,
+                    uri: artist.uri,
+                    name: artist.name,
+                }),
+                Err(err) => log::warn!("Skipping followed artist {}: {}", uri, err),
+            }
+        }
+
+        Ok(ArtistListPayload { items })
+    }
+
+    fn resolve_username(
+        &self,
+        session: &Session,
+        argument: &str,
+    ) -> Result<String, librespot_core::Error> {
+        if !argument.is_empty() && argument != "current" {
+            return Ok(argument.to_owned());
+        }
+
+        let username = session.username();
+        if !username.is_empty() {
+            return Ok(username);
+        }
+
+        Err(librespot_core::Error::failed_precondition(
+            "no username available for current-user librespot request",
+        ))
+    }
+
+    async fn fetch_lyrics_payload(
+        &self,
+        session: &Session,
+        track_uri: &str,
+    ) -> Result<LyricsPayload, librespot_core::Error> {
+        let track_id = Self::parse_track_id(track_uri)?;
+        let lyrics = LibrespotLyrics::get(session, &track_id).await?;
+        Ok(self.map_lyrics_payload(&lyrics))
+    }
+
+    async fn fetch_lyrics_for_image_payload(
+        &self,
+        session: &Session,
+        argument: &str,
+    ) -> Result<LyricsPayload, librespot_core::Error> {
+        let request: LyricsForImageRequest = serde_json::from_str(argument)
+            .map_err(|err| librespot_core::Error::invalid_argument(err.to_string()))?;
+        let track_id = Self::parse_track_id(&request.track_uri)?;
+        let image_id = Self::parse_file_id(&request.image_id_hex)?;
+        let lyrics = LibrespotLyrics::get_for_image(session, &track_id, &image_id).await?;
+        Ok(self.map_lyrics_payload(&lyrics))
+    }
+
+    async fn fetch_episode_payload(
+        &self,
+        session: &Session,
+        episode_uri: &str,
+    ) -> Result<EpisodePayload, librespot_core::Error> {
+        let uri = SpotifyUri::from_uri(episode_uri)?;
+        let episode = LibrespotEpisode::get(session, &uri).await?;
+        Ok(self.map_episode_payload(&episode))
+    }
+
+    async fn fetch_show_payload(
+        &self,
+        session: &Session,
+        show_uri: &str,
+    ) -> Result<ShowPayload, librespot_core::Error> {
+        let uri = SpotifyUri::from_uri(show_uri)?;
+        let show = LibrespotShow::get(session, &uri).await?;
+        Ok(self.map_show_payload(&show))
+    }
+
+    async fn fetch_playlist_annotation_payload(
+        &self,
+        session: &Session,
+        playlist_uri: &str,
+    ) -> Result<PlaylistAnnotationPayload, librespot_core::Error> {
+        let uri = SpotifyUri::from_uri(playlist_uri)?;
+        let annotation = LibrespotPlaylistAnnotation::get(session, &uri).await?;
+        Ok(self.map_playlist_annotation_payload(&annotation))
+    }
+
+    async fn fetch_user_followers_json_payload(
+        &self,
+        session: &Session,
+        username: &str,
+    ) -> Result<JsonPayload, librespot_core::Error> {
+        let bytes = session.spclient().get_user_followers(username).await?;
+        Self::json_payload_from_bytes(bytes)
+    }
+
+    async fn fetch_user_following_json_payload(
+        &self,
+        session: &Session,
+        username: &str,
+    ) -> Result<JsonPayload, librespot_core::Error> {
+        let bytes = session.spclient().get_user_following(username).await?;
+        Self::json_payload_from_bytes(bytes)
+    }
+
+    async fn fetch_radio_for_track_payload(
+        &self,
+        session: &Session,
+        track_uri: &str,
+    ) -> Result<JsonPayload, librespot_core::Error> {
+        let uri = SpotifyUri::from_uri(track_uri)?;
+        let bytes = session.spclient().get_radio_for_track(&uri).await?;
+        Self::json_payload_from_bytes(bytes)
+    }
+
+    async fn fetch_apollo_station_payload(
+        &self,
+        session: &Session,
+        argument: &str,
+    ) -> Result<JsonPayload, librespot_core::Error> {
+        let request: ApolloStationRequest = serde_json::from_str(argument)
+            .map_err(|err| librespot_core::Error::invalid_argument(err.to_string()))?;
+        let previous_tracks = request
+            .previous_track_uris
+            .iter()
+            .map(|uri| Self::parse_track_id(uri))
+            .collect::<Result<Vec<_>, _>>()?;
+        let bytes = session
+            .spclient()
+            .get_apollo_station(
+                &request.scope,
+                &request.context_uri,
+                request.count,
+                previous_tracks,
+                request.autoplay.unwrap_or(false),
+            )
+            .await?;
+        Self::json_payload_from_bytes(bytes)
+    }
+
+    async fn fetch_next_page_payload(
+        &self,
+        session: &Session,
+        next_page_uri: &str,
+    ) -> Result<JsonPayload, librespot_core::Error> {
+        let bytes = session.spclient().get_next_page(next_page_uri).await?;
+        Self::json_payload_from_bytes(bytes)
+    }
+
+    async fn fetch_audio_storage_payload(
+        &self,
+        session: &Session,
+        file_id_hex: &str,
+    ) -> Result<JsonPayload, librespot_core::Error> {
+        let file_id = Self::parse_file_id(file_id_hex)?;
+        let bytes = session.spclient().get_audio_storage(&file_id).await?;
+        Self::json_payload_from_bytes(bytes)
+    }
+
+    async fn fetch_audio_preview_payload(
+        &self,
+        session: &Session,
+        preview_id_hex: &str,
+    ) -> Result<BinaryPayload, librespot_core::Error> {
+        let file_id = Self::parse_file_id(preview_id_hex)?;
+        let bytes = session.spclient().get_audio_preview(&file_id).await?;
+        Ok(Self::binary_payload(preview_id_hex, "audio/mpeg", bytes.as_ref()))
+    }
+
+    async fn fetch_head_file_payload(
+        &self,
+        session: &Session,
+        file_id_hex: &str,
+    ) -> Result<BinaryPayload, librespot_core::Error> {
+        let file_id = Self::parse_file_id(file_id_hex)?;
+        let bytes = session.spclient().get_head_file(&file_id).await?;
+        Ok(Self::binary_payload(
+            file_id_hex,
+            "application/octet-stream",
+            bytes.as_ref(),
+        ))
+    }
+
+    async fn fetch_image_payload(
+        &self,
+        session: &Session,
+        image_id_hex: &str,
+    ) -> Result<BinaryPayload, librespot_core::Error> {
+        let file_id = Self::parse_file_id(image_id_hex)?;
+        let bytes = session.spclient().get_image(&file_id).await?;
+        Ok(Self::binary_payload(image_id_hex, "image/jpeg", bytes.as_ref()))
+    }
+
+    async fn fetch_context_payload(
+        &self,
+        session: &Session,
+        context_uri: &str,
+    ) -> Result<JsonPayload, librespot_core::Error> {
+        let context = session.spclient().get_context(context_uri).await?;
+        Self::json_payload_from_context(&context)
+    }
+
+    async fn fetch_autoplay_context_payload(
+        &self,
+        session: &Session,
+        argument: &str,
+    ) -> Result<JsonPayload, librespot_core::Error> {
+        let request: AutoplayContextRequestPayload = serde_json::from_str(argument)
+            .map_err(|err| librespot_core::Error::invalid_argument(err.to_string()))?;
+        let request_json = serde_json::to_string(&request)
+            .map_err(|err| librespot_core::Error::invalid_argument(err.to_string()))?;
+        let proto_request = protobuf_json_mapping::parse_from_str::<AutoplayContextRequest>(
+            &request_json,
+        )
+        .map_err(|err| librespot_core::Error::failed_precondition(err.to_string()))?;
+        let context = session.spclient().get_autoplay_context(&proto_request).await?;
+        Self::json_payload_from_context(&context)
+    }
+
+    async fn fetch_rootlist_payload(
+        &self,
+        session: &Session,
+        argument: &str,
+    ) -> Result<JsonPayload, librespot_core::Error> {
+        let request = if argument.trim().starts_with('{') {
+            serde_json::from_str::<RootlistRequest>(argument)
+                .map_err(|err| librespot_core::Error::invalid_argument(err.to_string()))?
+        } else {
+            RootlistRequest {
+                from: argument.trim().parse::<usize>().unwrap_or(0),
+                length: None,
+            }
+        };
+
+        let bytes = session
+            .spclient()
+            .get_rootlist(request.from, request.length)
+            .await?;
+        Self::json_payload_from_bytes(bytes)
+    }
+
+    fn collect_context_uris(&self, context: &Context, kind: &str) -> Vec<String> {
+        let mut uris = Vec::new();
+
+        if let Some(uri) = context.uri.as_ref() {
+            if uri.starts_with(&format!("spotify:{kind}:")) {
+                uris.push(uri.clone());
+            }
+        }
+
+        for page in &context.pages {
+            if let Some(page_url) = page.page_url.as_ref() {
+                let uri = self.page_url_to_uri(page_url);
+                if uri.starts_with(&format!("spotify:{kind}:")) {
+                    uris.push(uri);
+                }
+            }
+
+            for track in &page.tracks {
+                if let Some(uri) = track.uri.as_ref() {
+                    if uri.starts_with(&format!("spotify:{kind}:")) {
+                        uris.push(uri.clone());
+                    }
+                }
+            }
+        }
+
+        uris.sort();
+        uris.dedup();
+        uris
+    }
+
+    fn page_url_to_uri(&self, page_url: &str) -> String {
+        let split = if let Some(rest) = page_url.strip_prefix("hm://") {
+            rest.split('/')
+        } else {
+            page_url.split('/')
+        };
+
+        split
+            .skip_while(|s| s != &"spotify")
+            .take(3)
+            .collect::<Vec<&str>>()
+            .join(":")
+    }
+
+    fn json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+        for key in keys {
+            if let Some(candidate) = value.get(*key) {
+                if let Some(text) = candidate.as_str() {
+                    return Some(text.to_owned());
+                }
+                if let Some(inner) = candidate.get("value").and_then(|it| it.as_str()) {
+                    return Some(inner.to_owned());
+                }
+            }
+        }
+        None
+    }
+
+    fn find_first_image_url(value: &serde_json::Value) -> Option<String> {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(images) = map.get("images").and_then(|it| it.as_array()) {
+                    for image in images {
+                        if let Some(url) = image.get("url").and_then(|it| it.as_str()) {
+                            return Some(url.to_owned());
+                        }
+                    }
+                }
+
+                for child in map.values() {
+                    if let Some(url) = Self::find_first_image_url(child) {
+                        return Some(url);
+                    }
+                }
+                None
+            }
+            serde_json::Value::Array(items) => items.iter().find_map(Self::find_first_image_url),
+            _ => None,
+        }
+    }
+
+    fn collect_json_spotify_uris(
+        value: &serde_json::Value,
+        prefix: &str,
+        output: &mut Vec<String>,
+    ) {
+        match value {
+            serde_json::Value::String(text) => {
+                if text.starts_with(prefix) {
+                    output.push(text.clone());
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    Self::collect_json_spotify_uris(item, prefix, output);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for child in map.values() {
+                    Self::collect_json_spotify_uris(child, prefix, output);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_json_spotify_uris_in_order(
+        value: &serde_json::Value,
+        prefix: &str,
+        output: &mut Vec<String>,
+        seen: &mut std::collections::HashSet<String>,
+    ) {
+        match value {
+            serde_json::Value::String(text) => {
+                if text.starts_with(prefix) && seen.insert(text.clone()) {
+                    output.push(text.clone());
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    Self::collect_json_spotify_uris_in_order(item, prefix, output, seen);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for child in map.values() {
+                    Self::collect_json_spotify_uris_in_order(child, prefix, output, seen);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn extract_spotify_uris_from_bytes(bytes: &[u8], prefix: &str) -> Vec<String> {
+        let text = String::from_utf8_lossy(bytes);
+        let mut output = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut search_start = 0usize;
+
+        while let Some(found) = text[search_start..].find(prefix) {
+            let start = search_start + found;
+            let mut end = start;
+
+            for ch in text[start..].chars() {
+                let allowed = ch.is_ascii_alphanumeric() || ch == ':' || ch == '_';
+                if !allowed {
+                    break;
+                }
+                end += ch.len_utf8();
+            }
+
+            if end > start {
+                let candidate = &text[start..end];
+                if seen.insert(candidate.to_string()) {
+                    output.push(candidate.to_string());
+                }
+            }
+
+            search_start = start.saturating_add(prefix.len());
+            if search_start >= text.len() {
+                break;
+            }
+        }
+
+        output
+    }
+
+    fn parse_file_id(file_id_hex: &str) -> Result<FileId, librespot_core::Error> {
+        let bytes = hex::decode(file_id_hex)
+            .map_err(|err| librespot_core::Error::invalid_argument(err.to_string()))?;
+        Ok(FileId::from_raw(&bytes))
+    }
+
+    fn parse_track_id(track_uri: &str) -> Result<SpotifyId, librespot_core::Error> {
+        match SpotifyUri::from_uri(track_uri)? {
+            SpotifyUri::Track { id } => Ok(id),
+            _ => Err(librespot_core::Error::invalid_argument("track_uri")),
+        }
+    }
+
+    fn json_payload_from_bytes(
+        bytes: bytes::Bytes,
+    ) -> Result<JsonPayload, librespot_core::Error> {
+        let value = serde_json::from_slice(bytes.as_ref()).map_err(|err| {
+            let preview = String::from_utf8_lossy(bytes.as_ref())
+                .chars()
+                .take(240)
+                .collect::<String>()
+                .replace('\r', "\\r")
+                .replace('\n', "\\n");
+            log::warn!("Failed to parse JSON payload. Preview: {}", preview);
+            librespot_core::Error::failed_precondition(err.to_string())
+        })?;
+        Ok(JsonPayload { value })
+    }
+
+    fn json_payload_from_context(
+        context: &Context,
+    ) -> Result<JsonPayload, librespot_core::Error> {
+        let json = protobuf_json_mapping::print_to_string(context)
+            .map_err(|err| librespot_core::Error::failed_precondition(err.to_string()))?;
+        let value = serde_json::from_str(&json)
+            .map_err(|err| librespot_core::Error::failed_precondition(err.to_string()))?;
+        Ok(JsonPayload { value })
+    }
+
+    fn binary_payload(file_id_hex: &str, content_type: &str, bytes: &[u8]) -> BinaryPayload {
+        BinaryPayload {
+            file_id_hex: file_id_hex.to_owned(),
+            content_type: content_type.to_owned(),
+            byte_length: bytes.len(),
+            base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        }
+    }
+
+    fn map_lyrics_payload(&self, lyrics: &LibrespotLyrics) -> LyricsPayload {
+        LyricsPayload {
+            provider: lyrics.lyrics.provider.clone(),
+            provider_display_name: lyrics.lyrics.provider_display_name.clone(),
+            language: lyrics.lyrics.language.clone(),
+            sync_type: format!("{:?}", lyrics.lyrics.sync_type),
+            has_vocal_removal: lyrics.has_vocal_removal,
+            is_dense_typeface: lyrics.lyrics.is_dense_typeface,
+            is_rtl_language: lyrics.lyrics.is_rtl_language,
+            sync_lyrics_uri: lyrics.lyrics.sync_lyrics_uri.clone(),
+            lines: lyrics
+                .lyrics
+                .lines
+                .iter()
+                .map(|line| LyricsLinePayload {
+                    start_time_ms: line.start_time_ms.clone(),
+                    end_time_ms: line.end_time_ms.clone(),
+                    words: line.words.clone(),
+                })
+                .collect(),
+            colors: LyricsColorsPayload {
+                background: lyrics.colors.background,
+                text: lyrics.colors.text,
+                highlight_text: lyrics.colors.highlight_text,
+            },
+        }
+    }
+
+    fn map_episode_payload(&self, episode: &LibrespotEpisode) -> EpisodePayload {
+        EpisodePayload {
+            id: episode.id.to_id(),
+            uri: episode.id.to_uri(),
+            name: episode.name.clone(),
+            description: episode.description.clone(),
+            duration_ms: episode.duration,
+            number: episode.number,
+            publish_time: self.format_date(&episode.publish_time),
+            language: episode.language.clone(),
+            is_explicit: episode.is_explicit,
+            show_name: episode.show_name.clone(),
+            covers: self.map_images_from_images(&episode.covers),
+            freeze_frames: self.map_images_from_images(&episode.freeze_frames),
+            audio_files: self.map_audio_files(&episode.audio),
+            audio_previews: self.map_audio_files(&episode.audio_previews),
+            video_files: self.map_file_ids(&episode.videos),
+            video_previews: self.map_file_ids(&episode.video_previews),
+            restrictions: self.map_restrictions(&episode.restrictions),
+            availability: self.map_availabilities(&episode.availability),
+            keywords: episode.keywords.clone(),
+            allow_background_playback: episode.allow_background_playback,
+            external_url: episode.external_url.clone(),
+            episode_type: format!("{:?}", episode.episode_type),
+            has_music_and_talk: episode.has_music_and_talk,
+            content_ratings: self.map_content_ratings(&episode.content_rating),
+            is_audiobook_chapter: episode.is_audiobook_chapter,
+        }
+    }
+
+    fn map_show_payload(&self, show: &LibrespotShow) -> ShowPayload {
+        ShowPayload {
+            id: show.id.to_id(),
+            uri: show.id.to_uri(),
+            name: show.name.clone(),
+            description: show.description.clone(),
+            publisher: show.publisher.clone(),
+            language: show.language.clone(),
+            is_explicit: show.is_explicit,
+            covers: self.map_images_from_images(&show.covers),
+            episode_uris: show.episodes.iter().map(SpotifyUri::to_uri).collect(),
+            copyrights: self.map_copyrights(&show.copyrights),
+            restrictions: self.map_restrictions(&show.restrictions),
+            keywords: show.keywords.clone(),
+            media_type: format!("{:?}", show.media_type),
+            consumption_order: format!("{:?}", show.consumption_order),
+            availability: self.map_availabilities(&show.availability),
+            trailer_uri: show.trailer_uri.as_ref().map(SpotifyUri::to_uri),
+            has_music_and_talk: show.has_music_and_talk,
+            is_audiobook: show.is_audiobook,
+        }
+    }
+
+    fn map_playlist_annotation_payload(
+        &self,
+        annotation: &LibrespotPlaylistAnnotation,
+    ) -> PlaylistAnnotationPayload {
+        PlaylistAnnotationPayload {
+            description: annotation.description.clone(),
+            picture: annotation.picture.clone(),
+            transcoded_pictures: annotation
+                .transcoded_pictures
+                .iter()
+                .map(|picture| TranscodedPicturePayload {
+                    target_name: picture.target_name.clone(),
+                    uri: picture.uri.to_uri(),
+                })
+                .collect(),
+            has_abuse_reporting: annotation.has_abuse_reporting,
+            abuse_report_state: format!("{:?}", annotation.abuse_report_state),
+        }
+    }
+
+    fn map_images_from_images(
+        &self,
+        images: &librespot_metadata::image::Images,
+    ) -> Vec<ImageRefPayload> {
+        images
+            .iter()
+            .map(|image| ImageRefPayload {
+                file_id_hex: image.id.to_base16(),
+                size: format!("{:?}", image.size),
+                width: image.width,
+                height: image.height,
+            })
+            .collect()
+    }
+
+    fn map_audio_files(
+        &self,
+        files: &librespot_metadata::audio::AudioFiles,
+    ) -> Vec<AudioFilePayload> {
+        files
+            .iter()
+            .map(|(format, file_id)| AudioFilePayload {
+                format: format!("{:?}", format),
+                file_id_hex: file_id.to_base16(),
+                mime_type: librespot_metadata::audio::AudioFiles::mime_type(*format)
+                    .map(str::to_owned),
+            })
+            .collect()
+    }
+
+    fn map_file_ids<T>(&self, files: &T) -> Vec<String>
+    where
+        T: std::ops::Deref<Target = Vec<FileId>>,
+    {
+        files.iter().map(FileId::to_base16).collect()
+    }
+
+    fn map_restrictions(
+        &self,
+        restrictions: &librespot_metadata::restriction::Restrictions,
+    ) -> Vec<RestrictionPayload> {
+        restrictions
+            .iter()
+            .map(|restriction| RestrictionPayload {
+                restriction_type: format!("{:?}", restriction.restriction_type),
+                catalogues: restriction
+                    .catalogues
+                    .iter()
+                    .map(|catalogue| format!("{:?}", catalogue))
+                    .collect(),
+                catalogue_strs: restriction.catalogue_strs.clone(),
+                countries_allowed: restriction.countries_allowed.clone(),
+                countries_forbidden: restriction.countries_forbidden.clone(),
+            })
+            .collect()
+    }
+
+    fn map_availabilities(
+        &self,
+        availability: &librespot_metadata::availability::Availabilities,
+    ) -> Vec<AvailabilityPayload> {
+        availability
+            .iter()
+            .map(|entry| AvailabilityPayload {
+                catalogue_strs: entry.catalogue_strs.clone(),
+                start: self.format_date(&entry.start),
+            })
+            .collect()
+    }
+
+    fn map_content_ratings(
+        &self,
+        ratings: &librespot_metadata::content_rating::ContentRatings,
+    ) -> Vec<ContentRatingPayload> {
+        ratings
+            .iter()
+            .map(|rating| ContentRatingPayload {
+                country: rating.country.clone(),
+                tags: rating.tags.clone(),
+            })
+            .collect()
+    }
+
+    fn map_copyrights(
+        &self,
+        copyrights: &librespot_metadata::copyright::Copyrights,
+    ) -> Vec<CopyrightPayload> {
+        copyrights
+            .iter()
+            .map(|copyright| CopyrightPayload {
+                copyright_type: format!("{:?}", copyright.copyright_type),
+                text: copyright.text.clone(),
+            })
+            .collect()
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", content = "data", rename_all = "camelCase")]
+pub(crate) enum AppDataPayload {
+    Track(TrackPayload),
+    Album(AlbumPayload),
+    Artist(ArtistPayload),
+    Playlist(PlaylistPayload),
+    UserProfile(UserProfilePayload),
+    UserPlaylists(PlaylistListPayload),
+    SavedTracks(TrackListPayload),
+    Search(SearchPayload),
+    FollowedArtists(ArtistListPayload),
+    Lyrics(LyricsPayload),
+    LyricsForImage(LyricsPayload),
+    Episode(EpisodePayload),
+    Show(ShowPayload),
+    PlaylistAnnotation(PlaylistAnnotationPayload),
+    UserFollowersJson(JsonPayload),
+    UserFollowingJson(JsonPayload),
+    RadioForTrackJson(JsonPayload),
+    ApolloStationJson(JsonPayload),
+    NextPageJson(JsonPayload),
+    AudioStorageJson(JsonPayload),
+    AudioPreviewBinary(BinaryPayload),
+    HeadFileBinary(BinaryPayload),
+    ImageBinary(BinaryPayload),
+    ContextJson(JsonPayload),
+    AutoplayContextJson(JsonPayload),
+    RootlistJson(JsonPayload),
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ImagePayload {
+    url: String,
+    width: i32,
+    height: i32,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ArtistSummaryPayload {
+    id: String,
+    uri: String,
+    name: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AlbumSummaryPayload {
+    id: String,
+    uri: String,
+    name: String,
+    album_type: String,
+    images: Vec<ImagePayload>,
+    artists: Vec<ArtistSummaryPayload>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SimpleTrackPayload {
+    id: String,
+    uri: String,
+    name: String,
+    duration_ms: i32,
+    disc_number: i32,
+    track_number: i32,
+    artists: Vec<ArtistSummaryPayload>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TrackPayload {
+    id: String,
+    uri: String,
+    name: String,
+    duration_ms: i32,
+    disc_number: i32,
+    track_number: i32,
+    artists: Vec<ArtistSummaryPayload>,
+    album: AlbumSummaryPayload,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AlbumPayload {
+    id: String,
+    uri: String,
+    name: String,
+    album_type: String,
+    images: Vec<ImagePayload>,
+    artists: Vec<ArtistSummaryPayload>,
+    release_date: String,
+    total_tracks: i32,
+    tracks: Vec<SimpleTrackPayload>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ArtistPayload {
+    id: String,
+    uri: String,
+    name: String,
+    images: Vec<ImagePayload>,
+    albums: Vec<AlbumSummaryPayload>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PlaylistTrackPayload {
+    track: TrackPayload,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OwnerPayload {
+    id: String,
+    display_name: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PlaylistPayload {
+    id: String,
+    uri: String,
+    name: String,
+    images: Vec<ImagePayload>,
+    owner: OwnerPayload,
+    tracks: Vec<PlaylistTrackPayload>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UserProfilePayload {
+    id: String,
+    uri: String,
+    display_name: String,
+    email: String,
+    country: String,
+    images: Vec<ImagePayload>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PlaylistSummaryPayload {
+    id: String,
+    uri: String,
+    name: String,
+    images: Vec<ImagePayload>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PlaylistListPayload {
+    items: Vec<PlaylistSummaryPayload>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TrackListPayload {
+    items: Vec<TrackPayload>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ArtistListPayload {
+    items: Vec<ArtistSummaryPayload>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SearchPayload {
+    tracks: Vec<TrackPayload>,
+    albums: Vec<AlbumSummaryPayload>,
+    artists: Vec<ArtistSummaryPayload>,
+    playlists: Vec<PlaylistSummaryPayload>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonPayload {
+    value: serde_json::Value,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BinaryPayload {
+    file_id_hex: String,
+    content_type: String,
+    byte_length: usize,
+    base64: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LyricsPayload {
+    provider: String,
+    provider_display_name: String,
+    language: String,
+    sync_type: String,
+    has_vocal_removal: bool,
+    is_dense_typeface: bool,
+    is_rtl_language: bool,
+    sync_lyrics_uri: String,
+    lines: Vec<LyricsLinePayload>,
+    colors: LyricsColorsPayload,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LyricsLinePayload {
+    start_time_ms: String,
+    end_time_ms: String,
+    words: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LyricsColorsPayload {
+    background: i32,
+    text: i32,
+    highlight_text: i32,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EpisodePayload {
+    id: String,
+    uri: String,
+    name: String,
+    description: String,
+    duration_ms: i32,
+    number: i32,
+    publish_time: String,
+    language: String,
+    is_explicit: bool,
+    show_name: String,
+    covers: Vec<ImageRefPayload>,
+    freeze_frames: Vec<ImageRefPayload>,
+    audio_files: Vec<AudioFilePayload>,
+    audio_previews: Vec<AudioFilePayload>,
+    video_files: Vec<String>,
+    video_previews: Vec<String>,
+    restrictions: Vec<RestrictionPayload>,
+    availability: Vec<AvailabilityPayload>,
+    keywords: Vec<String>,
+    allow_background_playback: bool,
+    external_url: String,
+    episode_type: String,
+    has_music_and_talk: bool,
+    content_ratings: Vec<ContentRatingPayload>,
+    is_audiobook_chapter: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ShowPayload {
+    id: String,
+    uri: String,
+    name: String,
+    description: String,
+    publisher: String,
+    language: String,
+    is_explicit: bool,
+    covers: Vec<ImageRefPayload>,
+    episode_uris: Vec<String>,
+    copyrights: Vec<CopyrightPayload>,
+    restrictions: Vec<RestrictionPayload>,
+    keywords: Vec<String>,
+    media_type: String,
+    consumption_order: String,
+    availability: Vec<AvailabilityPayload>,
+    trailer_uri: Option<String>,
+    has_music_and_talk: bool,
+    is_audiobook: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlaylistAnnotationPayload {
+    description: String,
+    picture: String,
+    transcoded_pictures: Vec<TranscodedPicturePayload>,
+    has_abuse_reporting: bool,
+    abuse_report_state: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TranscodedPicturePayload {
+    target_name: String,
+    uri: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImageRefPayload {
+    file_id_hex: String,
+    size: String,
+    width: i32,
+    height: i32,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioFilePayload {
+    format: String,
+    file_id_hex: String,
+    mime_type: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RestrictionPayload {
+    restriction_type: String,
+    catalogues: Vec<String>,
+    catalogue_strs: Vec<String>,
+    countries_allowed: Option<Vec<String>>,
+    countries_forbidden: Option<Vec<String>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AvailabilityPayload {
+    catalogue_strs: Vec<String>,
+    start: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ContentRatingPayload {
+    country: String,
+    tags: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CopyrightPayload {
+    copyright_type: String,
+    text: String,
+}
+
+fn ffi_string(value: &str) -> *mut c_char {
+    CString::new(value.replace('\0', "\\0"))
+        .unwrap_or_default()
+        .into_raw()
+}
+
+fn ffi_box<T>(value: T) -> *mut T {
+    Box::into_raw(Box::new(value))
+}
+
+fn ffi_vec<T>(values: Vec<T>) -> (*mut T, usize) {
+    let mut values = values.into_boxed_slice();
+    let len = values.len();
+    let ptr = values.as_mut_ptr();
+    std::mem::forget(values);
+    (ptr, len)
+}
+
+pub(crate) fn alloc_ffi_track(payload: TrackPayload) -> *mut FfiTrack {
+    ffi_box(build_ffi_track(payload))
+}
+
+pub(crate) fn alloc_ffi_album(payload: AlbumPayload) -> *mut FfiAlbum {
+    ffi_box(build_ffi_album(payload))
+}
+
+pub(crate) fn alloc_ffi_artist(payload: ArtistPayload) -> *mut FfiArtist {
+    ffi_box(build_ffi_artist(payload))
+}
+
+pub(crate) fn alloc_ffi_playlist(payload: PlaylistPayload) -> *mut FfiPlaylist {
+    ffi_box(build_ffi_playlist(payload))
+}
+
+pub(crate) fn alloc_ffi_user_profile(payload: UserProfilePayload) -> *mut FfiUserProfile {
+    ffi_box(build_ffi_user_profile(payload))
+}
+
+pub(crate) fn alloc_ffi_playlist_list(payload: PlaylistListPayload) -> *mut FfiPlaylistList {
+    ffi_box(build_ffi_playlist_list(payload))
+}
+
+pub(crate) fn alloc_ffi_track_list(payload: TrackListPayload) -> *mut FfiTrackList {
+    ffi_box(build_ffi_track_list(payload))
+}
+
+pub(crate) fn alloc_ffi_artist_list(payload: ArtistListPayload) -> *mut FfiArtistList {
+    ffi_box(build_ffi_artist_list(payload))
+}
+
+pub(crate) fn alloc_ffi_search(payload: SearchPayload) -> *mut FfiSearch {
+    ffi_box(build_ffi_search(payload))
+}
+
+fn build_ffi_image(payload: ImagePayload) -> FfiImage {
+    FfiImage {
+        url: ffi_string(&payload.url),
+        width: payload.width,
+        height: payload.height,
+    }
+}
+
+fn build_ffi_artist_summary(payload: ArtistSummaryPayload) -> FfiArtistSummary {
+    FfiArtistSummary {
+        id: ffi_string(&payload.id),
+        uri: ffi_string(&payload.uri),
+        name: ffi_string(&payload.name),
+    }
+}
+
+fn build_ffi_album_summary(payload: AlbumSummaryPayload) -> FfiAlbumSummary {
+    let (images, image_count) = ffi_vec(payload.images.into_iter().map(build_ffi_image).collect());
+    let (artists, artist_count) = ffi_vec(
+        payload
+            .artists
+            .into_iter()
+            .map(build_ffi_artist_summary)
+            .collect(),
+    );
+
+    FfiAlbumSummary {
+        id: ffi_string(&payload.id),
+        uri: ffi_string(&payload.uri),
+        name: ffi_string(&payload.name),
+        album_type: ffi_string(&payload.album_type),
+        release_date: ffi_string(""),
+        total_tracks: 0,
+        images,
+        image_count,
+        artists,
+        artist_count,
+    }
+}
+
+fn build_ffi_simple_track(payload: SimpleTrackPayload) -> FfiSimpleTrack {
+    let (artists, artist_count) = ffi_vec(
+        payload
+            .artists
+            .into_iter()
+            .map(build_ffi_artist_summary)
+            .collect(),
+    );
+
+    FfiSimpleTrack {
+        id: ffi_string(&payload.id),
+        uri: ffi_string(&payload.uri),
+        name: ffi_string(&payload.name),
+        duration_ms: payload.duration_ms,
+        disc_number: payload.disc_number,
+        track_number: payload.track_number,
+        artists,
+        artist_count,
+    }
+}
+
+fn build_ffi_track(payload: TrackPayload) -> FfiTrack {
+    let (artists, artist_count) = ffi_vec(
+        payload
+            .artists
+            .into_iter()
+            .map(build_ffi_artist_summary)
+            .collect(),
+    );
+
+    FfiTrack {
+        id: ffi_string(&payload.id),
+        uri: ffi_string(&payload.uri),
+        name: ffi_string(&payload.name),
+        duration_ms: payload.duration_ms,
+        disc_number: payload.disc_number,
+        track_number: payload.track_number,
+        artists,
+        artist_count,
+        album: ffi_box(build_ffi_album_summary(payload.album)),
+    }
+}
+
+fn build_ffi_album(payload: AlbumPayload) -> FfiAlbum {
+    let (images, image_count) = ffi_vec(payload.images.into_iter().map(build_ffi_image).collect());
+    let (artists, artist_count) = ffi_vec(
+        payload
+            .artists
+            .into_iter()
+            .map(build_ffi_artist_summary)
+            .collect(),
+    );
+    let (tracks, track_count) = ffi_vec(payload.tracks.into_iter().map(build_ffi_simple_track).collect());
+
+    FfiAlbum {
+        id: ffi_string(&payload.id),
+        uri: ffi_string(&payload.uri),
+        name: ffi_string(&payload.name),
+        album_type: ffi_string(&payload.album_type),
+        release_date: ffi_string(&payload.release_date),
+        total_tracks: payload.total_tracks,
+        images,
+        image_count,
+        artists,
+        artist_count,
+        tracks,
+        track_count,
+    }
+}
+
+fn build_ffi_artist(payload: ArtistPayload) -> FfiArtist {
+    let (images, image_count) = ffi_vec(payload.images.into_iter().map(build_ffi_image).collect());
+    let (albums, album_count) = ffi_vec(
+        payload
+            .albums
+            .into_iter()
+            .map(build_ffi_album_summary)
+            .collect(),
+    );
+
+    FfiArtist {
+        id: ffi_string(&payload.id),
+        uri: ffi_string(&payload.uri),
+        name: ffi_string(&payload.name),
+        images,
+        image_count,
+        albums,
+        album_count,
+    }
+}
+
+fn build_ffi_owner(payload: OwnerPayload) -> FfiOwner {
+    FfiOwner {
+        id: ffi_string(&payload.id),
+        display_name: ffi_string(&payload.display_name),
+    }
+}
+
+fn build_ffi_playlist_summary(payload: PlaylistSummaryPayload) -> FfiPlaylistSummary {
+    let (images, image_count) = ffi_vec(payload.images.into_iter().map(build_ffi_image).collect());
+
+    FfiPlaylistSummary {
+        id: ffi_string(&payload.id),
+        uri: ffi_string(&payload.uri),
+        name: ffi_string(&payload.name),
+        images,
+        image_count,
+    }
+}
+
+fn build_ffi_playlist(payload: PlaylistPayload) -> FfiPlaylist {
+    let (images, image_count) = ffi_vec(payload.images.into_iter().map(build_ffi_image).collect());
+    let (tracks, track_count) = ffi_vec(
+        payload
+            .tracks
+            .into_iter()
+            .map(|item| build_ffi_track(item.track))
+            .collect(),
+    );
+
+    FfiPlaylist {
+        id: ffi_string(&payload.id),
+        uri: ffi_string(&payload.uri),
+        name: ffi_string(&payload.name),
+        images,
+        image_count,
+        owner: ffi_box(build_ffi_owner(payload.owner)),
+        tracks,
+        track_count,
+    }
+}
+
+fn build_ffi_user_profile(payload: UserProfilePayload) -> FfiUserProfile {
+    let (images, image_count) = ffi_vec(payload.images.into_iter().map(build_ffi_image).collect());
+
+    FfiUserProfile {
+        id: ffi_string(&payload.id),
+        uri: ffi_string(&payload.uri),
+        display_name: ffi_string(&payload.display_name),
+        email: ffi_string(&payload.email),
+        country: ffi_string(&payload.country),
+        images,
+        image_count,
+    }
+}
+
+fn build_ffi_playlist_list(payload: PlaylistListPayload) -> FfiPlaylistList {
+    let (items, item_count) = ffi_vec(
+        payload
+            .items
+            .into_iter()
+            .map(build_ffi_playlist_summary)
+            .collect(),
+    );
+
+    FfiPlaylistList { items, item_count }
+}
+
+fn build_ffi_track_list(payload: TrackListPayload) -> FfiTrackList {
+    let (items, item_count) = ffi_vec(payload.items.into_iter().map(build_ffi_track).collect());
+    FfiTrackList { items, item_count }
+}
+
+fn build_ffi_artist_list(payload: ArtistListPayload) -> FfiArtistList {
+    let (items, item_count) = ffi_vec(
+        payload
+            .items
+            .into_iter()
+            .map(build_ffi_artist_summary)
+            .collect(),
+    );
+    FfiArtistList { items, item_count }
+}
+
+fn build_ffi_search(payload: SearchPayload) -> FfiSearch {
+    let (tracks, track_count) = ffi_vec(payload.tracks.into_iter().map(build_ffi_track).collect());
+    let (albums, album_count) = ffi_vec(
+        payload
+            .albums
+            .into_iter()
+            .map(build_ffi_album_summary)
+            .collect(),
+    );
+    let (artists, artist_count) = ffi_vec(
+        payload
+            .artists
+            .into_iter()
+            .map(build_ffi_artist_summary)
+            .collect(),
+    );
+    let (playlists, playlist_count) = ffi_vec(
+        payload
+            .playlists
+            .into_iter()
+            .map(build_ffi_playlist_summary)
+            .collect(),
+    );
+
+    FfiSearch {
+        tracks,
+        track_count,
+        albums,
+        album_count,
+        artists,
+        artist_count,
+        playlists,
+        playlist_count,
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LyricsForImageRequest {
+    track_uri: String,
+    image_id_hex: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApolloStationRequest {
+    scope: String,
+    context_uri: String,
+    count: Option<usize>,
+    previous_track_uris: Vec<String>,
+    autoplay: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AutoplayContextRequestPayload {
+    context_uri: String,
+    recent_track_uris: Vec<String>,
+    is_video: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RootlistRequest {
+    from: usize,
+    length: Option<usize>,
 }
 
 fn load_offline_index(path: &PathBuf) -> HashMap<String, OfflineTrackIndexEntry> {

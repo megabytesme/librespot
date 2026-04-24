@@ -926,6 +926,16 @@ impl SpClient {
     pub async fn get_rootlist(&self, from: usize, length: Option<usize>) -> SpClientResult {
         let length = length.unwrap_or(120);
         let user = self.session().username();
+        self.get_rootlist_for_user(&user, from, Some(length)).await
+    }
+
+    pub async fn get_rootlist_for_user(
+        &self,
+        user: &str,
+        from: usize,
+        length: Option<usize>,
+    ) -> SpClientResult {
+        let length = length.unwrap_or(120);
         let endpoint = format!(
             "/playlist/v2/user/{user}/rootlist?decorate=revision,attributes,length,owner,capabilities,status_code&from={from}&length={length}"
         );
