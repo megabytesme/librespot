@@ -8,3 +8,4 @@ spotify_appkey.key
 .cache
 *.save
 *.*~
+lib_hack/
