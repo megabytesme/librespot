@@ -1,25 +1,32 @@
 use crate::{UserDataWrapper, ffi_types::*};
 use futures_util::StreamExt;
+use librespot_audio::Range;
 use librespot_connect::{
     ConnectConfig, LoadContextOptions, LoadRequest, LoadRequestOptions, Options, PlayingTrack,
     Spirc,
 };
 use librespot_core::{
-    Session, SessionConfig, SpotifyUri, authentication::Credentials, cache::Cache,
+    FileId, Session, SessionConfig, SpotifyUri, authentication::Credentials, cache::Cache,
     config::DeviceType,
 };
 use librespot_discovery::Discovery;
+use librespot_metadata::audio::{AudioFileFormat, AudioItem};
 use librespot_playback::{
     config::{AudioFormat, PlayerConfig},
     mixer::{self, MixerConfig},
-    player::{Player, PlayerEvent},
+    player::{OfflineTrackMetadata, Player, PlayerEvent},
 };
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, atomic::AtomicU8};
 use std::{ffi::CString, path::PathBuf, sync::atomic::AtomicUsize};
 use std::{mem::ManuallyDrop, pin::Pin};
 use tokio::sync::mpsc;
+use tokio::time::{Duration, Instant, sleep, sleep_until};
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -42,6 +49,11 @@ pub enum LibrespotCommand {
     UpdateCredentials {
         username: String,
         auth_data: String,
+    },
+    SetTrackPersisted {
+        track_uri: String,
+        persisted: bool,
+        result_tx: std_mpsc::Sender<bool>,
     },
     Stop,
 }
@@ -72,6 +84,19 @@ pub struct TrackMetadataInternal {
     pub album: CString,
     pub cover_url: CString,
     pub duration_ms: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OfflineTrackIndexEntry {
+    track_uri: String,
+    file_id_hex: String,
+    format: i32,
+    name: String,
+    artist: String,
+    album: String,
+    cover_url: String,
+    duration_ms: u32,
+    is_explicit: bool,
 }
 
 pub struct RunnerState {
@@ -120,6 +145,8 @@ pub struct Runner {
     callback: LibrespotCallback,
     user_data: UserDataWrapper,
     pub state: Arc<RunnerState>,
+    offline_index_path: PathBuf,
+    offline_index: HashMap<String, OfflineTrackIndexEntry>,
 }
 
 impl Runner {
@@ -131,6 +158,8 @@ impl Runner {
         user_data: UserDataWrapper,
         state: Arc<RunnerState>,
     ) -> Self {
+        let offline_index_path = setup.persisted_cache_dir.join("offline-index.json");
+        let offline_index = load_offline_index(&offline_index_path);
         Self {
             setup,
             cache,
@@ -138,6 +167,8 @@ impl Runner {
             callback,
             user_data,
             state,
+            offline_index_path,
+            offline_index,
         }
     }
 
@@ -153,7 +184,8 @@ impl Runner {
             Some((*self.cache).clone()),
         );
 
-        session.audio_key().set_ffi_hooks(
+        Self::attach_audio_key_hooks(
+            &session,
             self.setup.key_callback,
             self.setup.key_save_callback,
             self.user_data.0,
@@ -205,6 +237,8 @@ impl Runner {
 
         let mut last_creds = self.setup.initial_creds.clone();
         let mut connecting = last_creds.is_some();
+        let mut next_connect_attempt = Instant::now();
+        let mut connect_backoff = Duration::from_secs(1);
 
         loop {
             tokio::select! {
@@ -280,7 +314,33 @@ impl Runner {
                                 } else {
                                     let track_to_load = start_from_uri.unwrap_or(context_uri);
                                     if let Ok(t_uri) = SpotifyUri::from_uri(&track_to_load) {
-                                        player.load(t_uri, play, 0);
+                                        if let Some(entry) = self.offline_index.get(&track_to_load) {
+                                            if let Some(file_id) = parse_file_id_hex(&entry.file_id_hex) {
+                                                if let Ok(format) = AudioFileFormat::try_from(entry.format) {
+                                                    player.load_offline(
+                                                        t_uri,
+                                                        file_id,
+                                                        format,
+                                                        OfflineTrackMetadata {
+                                                            name: entry.name.clone(),
+                                                            artist: entry.artist.clone(),
+                                                            album: entry.album.clone(),
+                                                            cover_url: entry.cover_url.clone(),
+                                                            duration_ms: entry.duration_ms,
+                                                            is_explicit: entry.is_explicit,
+                                                        },
+                                                        play,
+                                                        0,
+                                                    );
+                                                } else {
+                                                    player.load(t_uri, play, 0);
+                                                }
+                                            } else {
+                                                player.load(t_uri, play, 0);
+                                            }
+                                        } else {
+                                            player.load(t_uri, play, 0);
+                                        }
                                     }
                                 }
                             }
@@ -291,6 +351,18 @@ impl Runner {
                             connecting = true;
                             if let Some(s) = spirc.take() { let _ = s.shutdown(); }
                             spirc_task = None;
+                        }
+                        LibrespotCommand::SetTrackPersisted { track_uri, persisted, result_tx } => {
+                            let result = self.set_track_persisted_async(&session, &track_uri, persisted).await;
+                            if let Err(ref err) = result {
+                                log::error!(
+                                    "Failed to set persisted={} for track <{}>: {:?}",
+                                    persisted,
+                                    track_uri,
+                                    err
+                                );
+                            }
+                            let _ = result_tx.send(result.is_ok());
                         }
                         LibrespotCommand::StartDiscovery => {
                             if discovery.is_none() {
@@ -325,11 +397,17 @@ impl Runner {
                     }
                 }
 
-                _ = async {}, if connecting && last_creds.is_some() => {
+                _ = sleep_until(next_connect_attempt), if connecting && last_creds.is_some() => {
                     if session.is_invalid() {
                         session = Session::new(
                             self.setup.session_config.clone(),
                             Some((*self.cache).clone()),
+                        );
+                        Self::attach_audio_key_hooks(
+                            &session,
+                            self.setup.key_callback,
+                            self.setup.key_save_callback,
+                            self.user_data.0,
                         );
                         player.set_session(session.clone());
                     }
@@ -348,13 +426,26 @@ impl Runner {
                             Ok((s, task)) => {
                                 spirc = Some(s);
                                 spirc_task = Some(Box::pin(task));
+                                connect_backoff = Duration::from_secs(1);
+                                next_connect_attempt = Instant::now();
                                 self.emit(LibrespotEvent {
                                     event_type: EventType::SessionConnected,
                                     data: unsafe { std::mem::zeroed() }
                                 });
                                 connecting = false;
                             }
-                            Err(e) => log::error!("Spirc connection failed: {:?}", e),
+                            Err(e) => {
+                                log::error!(
+                                    "Spirc connection failed: {:?}. Retrying in {:?}.",
+                                    e,
+                                    connect_backoff
+                                );
+                                next_connect_attempt = Instant::now() + connect_backoff;
+                                connect_backoff = std::cmp::min(
+                                    connect_backoff.saturating_mul(2),
+                                    Duration::from_secs(30),
+                                );
+                            }
                         }
                     }
                 }
@@ -371,6 +462,20 @@ impl Runner {
                 }
             }
         }
+    }
+
+    fn attach_audio_key_hooks(
+        session: &Session,
+        key_callback: Option<librespot_core::LibrespotKeyCallback>,
+        key_save_callback: Option<librespot_core::LibrespotKeySaveCallback>,
+        user_data: *mut std::ffi::c_void,
+    ) {
+        session.audio_key().set_ffi_hooks(
+            key_callback,
+            key_save_callback,
+            user_data,
+        );
+        log::info!("Attached frontend audio-key hooks to session");
     }
 
     fn handle_player_event(&self, event: PlayerEvent) {
@@ -639,4 +744,159 @@ impl Runner {
             }
         }
     }
+
+    fn preferred_formats(&self) -> [AudioFileFormat; 7] {
+        match self.setup.player_config.bitrate {
+            librespot_playback::config::Bitrate::Bitrate96 => [
+                AudioFileFormat::OGG_VORBIS_96,
+                AudioFileFormat::MP3_96,
+                AudioFileFormat::OGG_VORBIS_160,
+                AudioFileFormat::MP3_160,
+                AudioFileFormat::MP3_256,
+                AudioFileFormat::OGG_VORBIS_320,
+                AudioFileFormat::MP3_320,
+            ],
+            librespot_playback::config::Bitrate::Bitrate160 => [
+                AudioFileFormat::OGG_VORBIS_160,
+                AudioFileFormat::MP3_160,
+                AudioFileFormat::OGG_VORBIS_96,
+                AudioFileFormat::MP3_96,
+                AudioFileFormat::MP3_256,
+                AudioFileFormat::OGG_VORBIS_320,
+                AudioFileFormat::MP3_320,
+            ],
+            librespot_playback::config::Bitrate::Bitrate320 => [
+                AudioFileFormat::OGG_VORBIS_320,
+                AudioFileFormat::MP3_320,
+                AudioFileFormat::MP3_256,
+                AudioFileFormat::OGG_VORBIS_160,
+                AudioFileFormat::MP3_160,
+                AudioFileFormat::OGG_VORBIS_96,
+                AudioFileFormat::MP3_96,
+            ],
+        }
+    }
+
+    async fn set_track_persisted_async(
+        &mut self,
+        session: &Session,
+        track_uri: &str,
+        persisted: bool,
+    ) -> Result<(), librespot_core::Error> {
+        let parsed_uri = SpotifyUri::from_uri(track_uri)?;
+        let track_id: librespot_core::SpotifyId = (&parsed_uri)
+            .try_into()
+            .map_err(|_| librespot_core::Error::invalid_argument("track URI is not a playable Spotify track"))?;
+        let audio_item = AudioItem::get_file(session, parsed_uri).await?;
+        let (format, file_id) = self
+            .preferred_formats()
+            .iter()
+            .find_map(|format| {
+                audio_item
+                    .files
+                    .get(format)
+                    .copied()
+                    .map(|file_id| (*format, file_id))
+            })
+            .ok_or_else(|| {
+                librespot_core::Error::unavailable("track has no supported audio file")
+            })?;
+
+        if !persisted {
+            self.cache.set_persisted(file_id, false)?;
+            self.offline_index.remove(track_uri);
+            save_offline_index(&self.offline_index_path, &self.offline_index);
+            return Ok(());
+        }
+
+        let bytes_per_second = 40 * 1024;
+        let audio_file =
+            librespot_audio::AudioFile::open(session, file_id, bytes_per_second).await?;
+        let controller = audio_file.get_stream_loader_controller()?;
+        controller.set_random_access_mode();
+
+        let _key = session.audio_key().request(track_id, file_id).await?;
+        log::info!("Fetched audio key while persisting track <{}>", track_uri);
+
+        let total_len = controller.len();
+        let chunk_len = 256 * 1024;
+        let mut offset = 0;
+        while offset < total_len {
+            let remaining = total_len - offset;
+            let next_len = std::cmp::min(chunk_len, remaining);
+            controller.fetch_blocking(Range::new(offset, next_len))?;
+            offset += next_len;
+        }
+
+        for _ in 0..100 {
+            if self.cache.file(file_id).is_some() {
+                self.cache.set_persisted(file_id, true)?;
+                let artist = match &audio_item.unique_fields {
+                    librespot_metadata::audio::UniqueFields::Track { artists, .. } => artists
+                        .0
+                        .first()
+                        .map(|artist| artist.name.clone())
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                };
+                let album = match &audio_item.unique_fields {
+                    librespot_metadata::audio::UniqueFields::Track { album, .. } => album.clone(),
+                    _ => String::new(),
+                };
+                let cover_url = audio_item
+                    .covers
+                    .first()
+                    .map(|cover| cover.url.clone())
+                    .unwrap_or_default();
+                self.offline_index.insert(
+                    track_uri.to_owned(),
+                    OfflineTrackIndexEntry {
+                        track_uri: track_uri.to_owned(),
+                        file_id_hex: file_id.to_string(),
+                        format: format as i32,
+                        name: audio_item.name.clone(),
+                        artist,
+                        album,
+                        cover_url,
+                        duration_ms: audio_item.duration_ms,
+                        is_explicit: audio_item.is_explicit,
+                    },
+                );
+                save_offline_index(&self.offline_index_path, &self.offline_index);
+                return Ok(());
+            }
+
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        Err(librespot_core::Error::deadline_exceeded(
+            "timed out waiting for cached track file",
+        ))
+    }
+}
+
+fn load_offline_index(path: &PathBuf) -> HashMap<String, OfflineTrackIndexEntry> {
+    match fs::read_to_string(path) {
+        Ok(json) => serde_json::from_str::<Vec<OfflineTrackIndexEntry>>(&json)
+            .map(|items| {
+                items
+                    .into_iter()
+                    .map(|item| (item.track_uri.clone(), item))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Err(_) => HashMap::new(),
+    }
+}
+
+fn save_offline_index(path: &PathBuf, index: &HashMap<String, OfflineTrackIndexEntry>) {
+    let entries: Vec<_> = index.values().cloned().collect();
+    if let Ok(json) = serde_json::to_string_pretty(&entries) {
+        let _ = fs::write(path, json);
+    }
+}
+
+fn parse_file_id_hex(hex: &str) -> Option<FileId> {
+    let bytes = hex::decode(hex).ok()?;
+    Some(FileId::from_raw(&bytes))
 }

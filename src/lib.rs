@@ -9,6 +9,7 @@ use librespot_core::{FileId, cache::Cache};
 use std::ffi::{CStr, c_char};
 use std::os::raw::c_void;
 use std::sync::Arc;
+use std::sync::mpsc as std_mpsc;
 use std::sync::atomic::Ordering;
 use std::thread;
 use tokio::sync::mpsc;
@@ -139,6 +140,43 @@ pub unsafe extern "C" fn librespot_cache_set_persisted(
     };
 
     inst.cache.set_persisted(file_id, persisted).is_ok()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn librespot_track_set_persisted(
+    instance: *mut LibrespotInstance,
+    track_uri: *const c_char,
+    persisted: bool,
+) -> bool {
+    if instance.is_null() || track_uri.is_null() {
+        return false;
+    }
+
+    let track_uri = unsafe { CStr::from_ptr(track_uri) };
+    let track_uri = match track_uri.to_str() {
+        Ok(s) if !s.is_empty() => s.to_owned(),
+        _ => return false,
+    };
+
+    let (result_tx, result_rx) = std_mpsc::channel();
+    let inst = unsafe { instance.as_ref() };
+    let Some(inst) = inst else {
+        return false;
+    };
+
+    if inst
+        .cmd_tx
+        .send(LibrespotCommand::SetTrackPersisted {
+            track_uri,
+            persisted,
+            result_tx,
+        })
+        .is_err()
+    {
+        return false;
+    }
+
+    result_rx.recv().unwrap_or(false)
 }
 
 #[unsafe(no_mangle)]

@@ -34,7 +34,12 @@ use futures_util::{
     StreamExt, TryFutureExt, future, future::FusedFuture,
     stream::futures_unordered::FuturesUnordered,
 };
-use librespot_metadata::{audio::UniqueFields, track::Tracks};
+use librespot_metadata::{
+    artist::{ArtistRole, ArtistWithRole, ArtistsWithRole},
+    audio::{UniqueFields, item::CoverImage},
+    image::ImageSize,
+    track::Tracks,
+};
 
 use symphonia::core::io::MediaSource;
 use symphonia::core::probe::Hint;
@@ -67,6 +72,16 @@ pub enum SinkStatus {
 }
 
 pub type SinkEventCallback = Box<dyn Fn(SinkStatus) + Send>;
+
+#[derive(Debug, Clone)]
+pub struct OfflineTrackMetadata {
+    pub name: String,
+    pub artist: String,
+    pub album: String,
+    pub cover_url: String,
+    pub duration_ms: u32,
+    pub is_explicit: bool,
+}
 
 struct PlayerInternal {
     session: Session,
@@ -102,6 +117,14 @@ static PLAYER_COUNTER: AtomicUsize = AtomicUsize::new(0);
 enum PlayerCommand {
     Load {
         track_id: SpotifyUri,
+        play: bool,
+        position_ms: u32,
+    },
+    LoadOffline {
+        track_id: SpotifyUri,
+        file_id: librespot_core::FileId,
+        format: AudioFileFormat,
+        metadata: OfflineTrackMetadata,
         play: bool,
         position_ms: u32,
     },
@@ -553,6 +576,25 @@ impl Player {
         });
     }
 
+    pub fn load_offline(
+        &self,
+        track_id: SpotifyUri,
+        file_id: librespot_core::FileId,
+        format: AudioFileFormat,
+        metadata: OfflineTrackMetadata,
+        start_playing: bool,
+        position_ms: u32,
+    ) {
+        self.command(PlayerCommand::LoadOffline {
+            track_id,
+            file_id,
+            format,
+            metadata,
+            play: start_playing,
+            position_ms,
+        });
+    }
+
     pub fn preload(&self, track_id: SpotifyUri) {
         self.command(PlayerCommand::Preload { track_id });
     }
@@ -979,6 +1021,77 @@ impl PlayerTrackLoader {
         }
     }
 
+    async fn load_offline_track(
+        &self,
+        track_uri: SpotifyUri,
+        file_id: librespot_core::FileId,
+        format: AudioFileFormat,
+        metadata: OfflineTrackMetadata,
+        position_ms: u32,
+    ) -> Option<PlayerLoadedTrackData> {
+        let track_id: SpotifyId = match (&track_uri).try_into() {
+            Ok(id) => id,
+            Err(_) => {
+                warn!("<{track_uri}> could not be converted to a base62 ID");
+                return None;
+            }
+        };
+
+        let cached_file = self.session.cache().and_then(|cache| cache.file(file_id));
+        let Some(cached_file) = cached_file else {
+            warn!("Offline track file {file_id} is not available in cache");
+            return None;
+        };
+
+        let audio_item = AudioItem {
+            track_id: track_uri.clone(),
+            uri: track_uri.to_uri(),
+            files: Default::default(),
+            name: metadata.name.clone(),
+            covers: if metadata.cover_url.is_empty() {
+                vec![]
+            } else {
+                vec![CoverImage {
+                    url: metadata.cover_url,
+                    size: ImageSize::DEFAULT,
+                    width: 0,
+                    height: 0,
+                }]
+            },
+            language: vec![],
+            duration_ms: metadata.duration_ms,
+            is_explicit: metadata.is_explicit,
+            availability: Ok(()),
+            alternatives: None,
+            unique_fields: UniqueFields::Track {
+                artists: ArtistsWithRole(vec![ArtistWithRole {
+                    id: track_uri.clone(),
+                    name: metadata.artist.clone(),
+                    role: ArtistRole::ARTIST_ROLE_MAIN_ARTIST,
+                }]),
+                album: metadata.album.clone(),
+                album_artists: if metadata.artist.is_empty() {
+                    vec![]
+                } else {
+                    vec![metadata.artist]
+                },
+                popularity: 0,
+                number: 0,
+                disc_number: 0,
+            },
+        };
+
+        self.load_open_audio_file(
+            track_id,
+            AudioFile::Cached(cached_file),
+            file_id,
+            format,
+            audio_item,
+            position_ms,
+        )
+        .await
+    }
+
     async fn load_remote_track(
         &self,
         track_uri: SpotifyUri,
@@ -1059,14 +1172,8 @@ impl PlayerTrackLoader {
                 }
             };
 
-        let bytes_per_second = self.stream_data_rate(format)?;
-
-        // This is only a loop to be able to reload the file if an error occurred
-        // while opening a cached file.
-        loop {
-            let encrypted_file = AudioFile::open(&self.session, file_id, bytes_per_second);
-
-            let encrypted_file = match encrypted_file.await {
+        let encrypted_file =
+            match AudioFile::open(&self.session, file_id, self.stream_data_rate(format)?).await {
                 Ok(encrypted_file) => encrypted_file,
                 Err(e) => {
                     error!("Unable to load encrypted file: {e:?}");
@@ -1074,8 +1181,31 @@ impl PlayerTrackLoader {
                 }
             };
 
-            let is_cached = encrypted_file.is_cached();
+        self.load_open_audio_file(
+            track_id,
+            encrypted_file,
+            file_id,
+            format,
+            audio_item,
+            position_ms,
+        )
+        .await
+    }
 
+    async fn load_open_audio_file(
+        &self,
+        track_id: SpotifyId,
+        encrypted_file: AudioFile,
+        file_id: librespot_core::FileId,
+        format: AudioFileFormat,
+        audio_item: AudioItem,
+        position_ms: u32,
+    ) -> Option<PlayerLoadedTrackData> {
+        let bytes_per_second = self.stream_data_rate(format)?;
+        let mut encrypted_file = encrypted_file;
+
+        loop {
+            let is_cached = encrypted_file.is_cached();
             let stream_loader_controller = encrypted_file.get_stream_loader_controller().ok()?;
 
             // Not all audio files are encrypted. If we can't get a key, try loading the track
@@ -1162,7 +1292,14 @@ impl PlayerTrackLoader {
                         }
                     }
 
-                    // Just try it again
+                    encrypted_file =
+                        match AudioFile::open(&self.session, file_id, bytes_per_second).await {
+                            Ok(file) => file,
+                            Err(err) => {
+                                error!("Unable to reload encrypted file: {err:?}");
+                                return None;
+                            }
+                        };
                     continue;
                 }
                 Err(e) => {
@@ -2153,6 +2290,39 @@ impl PlayerInternal {
         Ok(())
     }
 
+    fn handle_command_load_offline(
+        &mut self,
+        track_id: SpotifyUri,
+        file_id: librespot_core::FileId,
+        format: AudioFileFormat,
+        metadata: OfflineTrackMetadata,
+        play: bool,
+        position_ms: u32,
+    ) -> PlayerResult {
+        let play_request_id = self.play_request_id_generator.get();
+        self.send_event(PlayerEvent::PlayRequestIdChanged { play_request_id });
+
+        if !self.config.gapless {
+            self.ensure_sink_stopped(play);
+        }
+
+        self.preload = PlayerPreload::None;
+        self.state = PlayerState::Loading {
+            track_id: track_id.clone(),
+            play_request_id,
+            start_playback: play,
+            loader: Box::pin(self.load_offline_track(
+                track_id,
+                file_id,
+                format,
+                metadata,
+                position_ms,
+            )),
+        };
+
+        Ok(())
+    }
+
     fn handle_command_preload(&mut self, track_id: SpotifyUri) {
         debug!("Preloading track");
         let mut preload_track = true;
@@ -2278,6 +2448,22 @@ impl PlayerInternal {
                 play,
                 position_ms,
             } => self.handle_command_load(track_id, None, play, position_ms)?,
+
+            PlayerCommand::LoadOffline {
+                track_id,
+                file_id,
+                format,
+                metadata,
+                play,
+                position_ms,
+            } => self.handle_command_load_offline(
+                track_id,
+                file_id,
+                format,
+                metadata,
+                play,
+                position_ms,
+            )?,
 
             PlayerCommand::Preload { track_id } => self.handle_command_preload(track_id),
 
@@ -2426,6 +2612,46 @@ impl PlayerInternal {
         result_rx.map_err(|_| ())
     }
 
+    fn load_offline_track(
+        &mut self,
+        spotify_uri: SpotifyUri,
+        file_id: librespot_core::FileId,
+        format: AudioFileFormat,
+        metadata: OfflineTrackMetadata,
+        position_ms: u32,
+    ) -> impl FusedFuture<Output = Result<PlayerLoadedTrackData, ()>> + Send + 'static {
+        let loader = PlayerTrackLoader {
+            session: self.session.clone(),
+            config: self.config.clone(),
+            local_file_lookup: self.local_file_lookup.clone(),
+        };
+
+        let (result_tx, result_rx) = oneshot::channel();
+        let load_handles_clone = self.load_handles.clone();
+        let handle = tokio::runtime::Handle::current();
+
+        let load_handle = thread::spawn(move || {
+            let data = handle.block_on(loader.load_offline_track(
+                spotify_uri,
+                file_id,
+                format,
+                metadata,
+                position_ms,
+            ));
+            if let Some(data) = data {
+                let _ = result_tx.send(data);
+            }
+
+            let mut load_handles = load_handles_clone.lock().expect(LOAD_HANDLES_POISON_MSG);
+            load_handles.remove(&thread::current().id());
+        });
+
+        let mut load_handles = self.load_handles.lock().expect(LOAD_HANDLES_POISON_MSG);
+        load_handles.insert(load_handle.thread().id(), load_handle);
+
+        result_rx.map_err(|_| ())
+    }
+
     fn preload_data_before_playback(&mut self) -> PlayerResult {
         if let PlayerState::Playing {
             bytes_per_second,
@@ -2480,6 +2706,21 @@ impl fmt::Debug for PlayerCommand {
             } => f
                 .debug_tuple("Load")
                 .field(&track_id)
+                .field(&play)
+                .field(&position_ms)
+                .finish(),
+            PlayerCommand::LoadOffline {
+                track_id,
+                file_id,
+                format,
+                play,
+                position_ms,
+                ..
+            } => f
+                .debug_tuple("LoadOffline")
+                .field(&track_id)
+                .field(&file_id)
+                .field(&format)
                 .field(&play)
                 .field(&position_ms)
                 .finish(),
