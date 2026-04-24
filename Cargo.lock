@@ -1788,6 +1788,7 @@ dependencies = [
  "librespot-playback",
  "librespot-protocol",
  "log",
+ "protobuf",
  "protobuf-json-mapping",
  "serde",
  "serde_json",

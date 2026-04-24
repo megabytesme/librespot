@@ -17,7 +17,9 @@ use librespot_metadata::{
 };
 use librespot_protocol::{
     autoplay_context_request::AutoplayContextRequest, context::Context,
+    playlist4_external::SelectedListContent,
 };
+use protobuf::Message;
 use librespot_discovery::Discovery;
 use librespot_metadata::audio::{AudioFileFormat, AudioItem};
 use librespot_playback::{
@@ -972,7 +974,7 @@ impl Runner {
     ) -> Result<TrackPayload, librespot_core::Error> {
         let uri = SpotifyUri::from_uri(track_uri)?;
         let track = LibrespotTrack::get(session, &uri).await?;
-        let album = self.fetch_album_summary_by_uri(session, &track.album.id.to_uri()).await?;
+        let album = self.map_album_summary_payload(session, &track.album);
         Ok(self.map_track_payload(&track, album))
     }
 
@@ -1055,20 +1057,12 @@ impl Runner {
         for item in playlist.contents.items.iter() {
             if matches!(item.id, SpotifyUri::Track { .. }) {
                 match LibrespotTrack::get(session, &item.id).await {
-                    Ok(track) => match self
-                        .fetch_album_summary_by_uri(session, &track.album.id.to_uri())
-                        .await
-                    {
-                        Ok(album) => items.push(PlaylistTrackPayload {
-                            track: self.map_track_payload(&track, album),
-                        }),
-                        Err(err) => log::warn!(
-                            "Skipping playlist track album {} for {}: {}",
-                            track.album.id.to_uri(),
-                            playlist_uri,
-                            err
+                    Ok(track) => items.push(PlaylistTrackPayload {
+                        track: self.map_track_payload(
+                            &track,
+                            self.map_album_summary_payload(session, &track.album),
                         ),
-                    },
+                    }),
                     Err(err) => log::warn!(
                         "Skipping playlist track {} for {}: {}",
                         item.id.to_uri(),
@@ -1113,6 +1107,36 @@ impl Runner {
         })
     }
 
+    async fn fetch_playlist_summary_by_uri(
+        &self,
+        session: &Session,
+        playlist_uri: &str,
+    ) -> Result<PlaylistSummaryPayload, librespot_core::Error> {
+        let uri = SpotifyUri::from_uri(playlist_uri)?;
+        let playlist = LibrespotPlaylist::get(session, &uri).await?;
+        let image_url = playlist
+            .attributes
+            .picture_sizes
+            .first()
+            .map(|picture| picture.url.clone())
+            .unwrap_or_default();
+
+        Ok(PlaylistSummaryPayload {
+            id: playlist.id.to_id(),
+            uri: playlist.id.to_uri(),
+            name: playlist.attributes.name,
+            images: if image_url.is_empty() {
+                Vec::new()
+            } else {
+                vec![ImagePayload {
+                    url: image_url,
+                    width: 0,
+                    height: 0,
+                }]
+            },
+        })
+    }
+
     async fn fetch_album_summary_by_uri(
         &self,
         session: &Session,
@@ -1120,14 +1144,22 @@ impl Runner {
     ) -> Result<AlbumSummaryPayload, librespot_core::Error> {
         let uri = SpotifyUri::from_uri(album_uri)?;
         let album = LibrespotAlbum::get(session, &uri).await?;
-        Ok(AlbumSummaryPayload {
+        Ok(self.map_album_summary_payload(session, &album))
+    }
+
+    fn map_album_summary_payload(
+        &self,
+        session: &Session,
+        album: &LibrespotAlbum,
+    ) -> AlbumSummaryPayload {
+        AlbumSummaryPayload {
             id: album.id.to_id(),
             uri: album.id.to_uri(),
-            name: album.name,
+            name: album.name.clone(),
             album_type: format!("{:?}", album.album_type).to_lowercase(),
             images: self.map_images(session, &album.covers),
             artists: self.map_artists(&album.artists),
-        })
+        }
     }
 
     fn map_track_payload(&self, track: &LibrespotTrack, album: AlbumSummaryPayload) -> TrackPayload {
@@ -1295,7 +1327,23 @@ impl Runner {
         bytes: &[u8],
         limit: usize,
     ) -> Result<PlaylistListPayload, librespot_core::Error> {
-        let mut uris = match serde_json::from_slice::<serde_json::Value>(bytes) {
+        let uris = match SelectedListContent::parse_from_bytes(bytes) {
+            Ok(rootlist) => {
+                let mut uris = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+
+                if let Some(contents) = rootlist.contents.as_ref() {
+                    for item in &contents.items {
+                        let uri = item.uri();
+                        if uri.starts_with("spotify:playlist:") && seen.insert(uri.to_string()) {
+                            uris.push(uri.to_string());
+                        }
+                    }
+                }
+
+                uris
+            }
+            Err(proto_err) => match serde_json::from_slice::<serde_json::Value>(bytes) {
             Ok(value) => {
                 let mut uris = Vec::new();
                 let mut seen = std::collections::HashSet::new();
@@ -1314,10 +1362,15 @@ impl Runner {
                     .collect::<String>()
                     .replace('\r', "\\r")
                     .replace('\n', "\\n");
-                log::warn!("Failed to parse playlist list payload. Preview: {}", preview);
+                log::warn!(
+                    "Failed to parse playlist list payload as protobuf ({}) or JSON ({}). Preview: {}",
+                    proto_err,
+                    err,
+                    preview
+                );
                 Self::extract_spotify_uris_from_bytes(bytes, "spotify:playlist:")
             }
-        };
+        }};
 
         if uris.is_empty() {
             return Err(librespot_core::Error::failed_precondition(
@@ -1327,13 +1380,8 @@ impl Runner {
 
         let mut playlists = Vec::new();
         for uri in uris.into_iter().take(limit) {
-            match self.fetch_playlist_payload(session, &uri).await {
-                Ok(playlist) => playlists.push(PlaylistSummaryPayload {
-                    id: playlist.id,
-                    uri: playlist.uri,
-                    name: playlist.name,
-                    images: playlist.images,
-                }),
+            match self.fetch_playlist_summary_by_uri(session, &uri).await {
+                Ok(playlist) => playlists.push(playlist),
                 Err(err) => log::warn!("Skipping user playlist {}: {}", uri, err),
             }
         }
@@ -1399,13 +1447,7 @@ impl Runner {
 
         let mut playlists = Vec::new();
         for uri in playlist_uris.into_iter().take(20) {
-            let playlist = self.fetch_playlist_payload(session, &uri).await?;
-            playlists.push(PlaylistSummaryPayload {
-                id: playlist.id,
-                uri: playlist.uri,
-                name: playlist.name,
-                images: playlist.images,
-            });
+            playlists.push(self.fetch_playlist_summary_by_uri(session, &uri).await?);
         }
 
         Ok(SearchPayload {
