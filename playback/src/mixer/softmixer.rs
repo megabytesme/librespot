@@ -20,7 +20,7 @@ impl Mixer for SoftMixer {
         info!("Mixing with softvol and volume control: {volume_ctrl:?}");
 
         Ok(Self {
-            volume: Arc::new(AtomicU64::new(f64::to_bits(0.5))),
+            volume: Arc::new(AtomicU64::new(f64::to_bits(1.0))),
             volume_ctrl,
         })
     }

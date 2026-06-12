@@ -84,7 +84,7 @@ pub fn parse_ffi_config(c_cfg: &LibrespotConfig) -> Result<RunnerSetup, String> 
         let connect_config = ConnectConfig {
             name: device_name.clone(),
             device_type,
-            initial_volume: 50,
+            initial_volume: c_cfg.initial_volume,
             ..ConnectConfig::default()
         };
 

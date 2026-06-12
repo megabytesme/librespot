@@ -84,7 +84,7 @@ pub struct ConnectConfig {
     pub device_type: DeviceType,
     /// Displays the [DeviceType] twice in the ui to show up as a group (default: false)
     pub is_group: bool,
-    /// The volume with which the connect device will be initialized (default: 50%)
+    /// The volume with which the connect device will be initialized (default: 100%)
     pub initial_volume: u16,
     /// Disables the option to control the volume remotely (default: false)
     pub disable_volume: bool,
@@ -98,7 +98,7 @@ impl Default for ConnectConfig {
             name: "librespot".to_string(),
             device_type: DeviceType::Speaker,
             is_group: false,
-            initial_volume: u16::MAX / 2,
+            initial_volume: u16::MAX,
             disable_volume: false,
             volume_steps: 64,
         }

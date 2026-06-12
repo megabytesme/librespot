@@ -15,6 +15,7 @@ pub struct LibrespotConfig {
     pub enable_volume_normalisation: bool,
     pub bitrate: Bitrate,
     pub format: AudioFormat,
+    pub initial_volume: u16,
     pub username: *const c_char,
     pub password: *const c_char,
     pub auth_blob: *const c_char,
