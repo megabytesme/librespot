@@ -30,6 +30,7 @@ use librespot_playback::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::io::ErrorKind;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::mpsc as std_mpsc;
@@ -163,6 +164,8 @@ pub struct Runner {
     pub state: Arc<RunnerState>,
     offline_index_path: PathBuf,
     offline_index: HashMap<String, OfflineTrackIndexEntry>,
+    lyrics_volatile_dir: PathBuf,
+    lyrics_persisted_dir: PathBuf,
 }
 
 impl Runner {
@@ -176,6 +179,8 @@ impl Runner {
     ) -> Self {
         let offline_index_path = setup.persisted_cache_dir.join("offline-index.json");
         let offline_index = load_offline_index(&offline_index_path);
+        let lyrics_volatile_dir = setup.cache_dir.join("lyrics");
+        let lyrics_persisted_dir = setup.persisted_cache_dir.join("lyrics");
         Self {
             setup,
             cache,
@@ -185,6 +190,8 @@ impl Runner {
             state,
             offline_index_path,
             offline_index,
+            lyrics_volatile_dir,
+            lyrics_persisted_dir,
         }
     }
 
@@ -370,6 +377,14 @@ impl Runner {
                         }
                         LibrespotCommand::SetTrackPersisted { track_uri, persisted, result_tx } => {
                             let result = self.set_track_persisted_async(&session, &track_uri, persisted).await;
+                            if result.is_ok() {
+                                if persisted {
+                                    let _ = self.prefetch_lyrics_payload(&session, &track_uri).await;
+                                    let _ = self.move_cached_lyrics(&track_uri, true);
+                                } else {
+                                    self.remove_cached_lyrics(&track_uri);
+                                }
+                            }
                             if let Err(ref err) = result {
                                 log::error!(
                                     "Failed to set persisted={} for track <{}>: {:?}",
@@ -405,6 +420,10 @@ impl Runner {
                 }
 
                 Some(event) = player_rx.recv() => {
+                    if let PlayerEvent::TrackChanged { ref audio_item } = event {
+                        let _ = self.prefetch_lyrics_payload(&session, &audio_item.uri).await;
+                    }
+
                     self.handle_player_event(event);
                 }
 
@@ -1530,9 +1549,16 @@ impl Runner {
         session: &Session,
         track_uri: &str,
     ) -> Result<LyricsPayload, librespot_core::Error> {
+        if let Some(cached) = self.read_cached_lyrics(track_uri)? {
+            log::info!("Returning cached lyrics for {}", track_uri);
+            return Ok(cached);
+        }
+
         let track_id = Self::parse_track_id(track_uri)?;
         let lyrics = LibrespotLyrics::get(session, &track_id).await?;
-        Ok(self.map_lyrics_payload(&lyrics))
+        let payload = self.map_lyrics_payload(&lyrics);
+        self.write_cached_lyrics(track_uri, &payload)?;
+        Ok(payload)
     }
 
     async fn fetch_lyrics_for_image_payload(
@@ -1542,10 +1568,32 @@ impl Runner {
     ) -> Result<LyricsPayload, librespot_core::Error> {
         let request: LyricsForImageRequest = serde_json::from_str(argument)
             .map_err(|err| librespot_core::Error::invalid_argument(err.to_string()))?;
+        if let Some(cached) = self.read_cached_lyrics(&request.track_uri)? {
+            log::info!("Returning cached lyrics for {} (image variant request)", request.track_uri);
+            return Ok(cached);
+        }
         let track_id = Self::parse_track_id(&request.track_uri)?;
         let image_id = Self::parse_file_id(&request.image_id_hex)?;
         let lyrics = LibrespotLyrics::get_for_image(session, &track_id, &image_id).await?;
-        Ok(self.map_lyrics_payload(&lyrics))
+        let payload = self.map_lyrics_payload(&lyrics);
+        self.write_cached_lyrics(&request.track_uri, &payload)?;
+        Ok(payload)
+    }
+
+    async fn prefetch_lyrics_payload(
+        &self,
+        session: &Session,
+        track_uri: &str,
+    ) -> Result<(), librespot_core::Error> {
+        if self.read_cached_lyrics(track_uri)?.is_some() {
+            return Ok(());
+        }
+
+        let track_id = Self::parse_track_id(track_uri)?;
+        let lyrics = LibrespotLyrics::get(session, &track_id).await?;
+        let payload = self.map_lyrics_payload(&lyrics);
+        self.write_cached_lyrics(track_uri, &payload)?;
+        Ok(())
     }
 
     async fn fetch_episode_payload(
@@ -1975,6 +2023,99 @@ impl Runner {
         }
     }
 
+    fn is_track_persisted(&self, track_uri: &str) -> bool {
+        self.offline_index.contains_key(track_uri)
+    }
+
+    fn lyrics_path(&self, track_uri: &str, persisted: bool) -> PathBuf {
+        let root = if persisted {
+            &self.lyrics_persisted_dir
+        } else {
+            &self.lyrics_volatile_dir
+        };
+        root.join(format!("{}.lyrics.json", Self::sha1_hex(track_uri.as_bytes())))
+    }
+
+    fn read_cached_lyrics(
+        &self,
+        track_uri: &str,
+    ) -> Result<Option<LyricsPayload>, librespot_core::Error> {
+        let preferred_persisted = self.is_track_persisted(track_uri);
+        let primary = self.lyrics_path(track_uri, preferred_persisted);
+        let secondary = self.lyrics_path(track_uri, !preferred_persisted);
+
+        for path in [primary, secondary] {
+            match fs::read_to_string(&path) {
+                Ok(json) => {
+                    let payload = serde_json::from_str::<LyricsPayload>(&json)
+                        .map_err(|err| librespot_core::Error::failed_precondition(err.to_string()))?;
+                    return Ok(Some(payload));
+                }
+                Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(librespot_core::Error::failed_precondition(err.to_string()));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn write_cached_lyrics(
+        &self,
+        track_uri: &str,
+        payload: &LyricsPayload,
+    ) -> Result<(), librespot_core::Error> {
+        let persisted = self.is_track_persisted(track_uri);
+        let target = self.lyrics_path(track_uri, persisted);
+        let alternate = self.lyrics_path(track_uri, !persisted);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|err| librespot_core::Error::failed_precondition(err.to_string()))?;
+        }
+        let json = serde_json::to_string_pretty(payload)
+            .map_err(|err| librespot_core::Error::failed_precondition(err.to_string()))?;
+        fs::write(&target, json)
+            .map_err(|err| librespot_core::Error::failed_precondition(err.to_string()))?;
+        let _ = fs::remove_file(alternate);
+        Ok(())
+    }
+
+    fn move_cached_lyrics(
+        &self,
+        track_uri: &str,
+        persisted: bool,
+    ) -> Result<(), librespot_core::Error> {
+        let source = self.lyrics_path(track_uri, !persisted);
+        let target = self.lyrics_path(track_uri, persisted);
+        if !source.exists() {
+            return Ok(());
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|err| librespot_core::Error::failed_precondition(err.to_string()))?;
+        }
+        fs::rename(&source, &target)
+            .or_else(|_| {
+                fs::copy(&source, &target)
+                    .and_then(|_| fs::remove_file(&source))
+                    .map(|_| ())
+            })
+            .map_err(|err| librespot_core::Error::failed_precondition(err.to_string()))?;
+        Ok(())
+    }
+
+    fn remove_cached_lyrics(&self, track_uri: &str) {
+        let _ = fs::remove_file(self.lyrics_path(track_uri, false));
+        let _ = fs::remove_file(self.lyrics_path(track_uri, true));
+    }
+
+    fn sha1_hex(bytes: &[u8]) -> String {
+        use sha1::Digest;
+        let digest = sha1::Sha1::digest(bytes);
+        hex::encode(digest)
+    }
+
     fn map_episode_payload(&self, episode: &LibrespotEpisode) -> EpisodePayload {
         EpisodePayload {
             id: episode.id.to_id(),
@@ -2338,7 +2479,7 @@ struct BinaryPayload {
     base64: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LyricsPayload {
     provider: String,
@@ -2353,7 +2494,7 @@ struct LyricsPayload {
     colors: LyricsColorsPayload,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LyricsLinePayload {
     start_time_ms: String,
@@ -2361,7 +2502,7 @@ struct LyricsLinePayload {
     words: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LyricsColorsPayload {
     background: i32,
