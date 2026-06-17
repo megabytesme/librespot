@@ -512,6 +512,7 @@ impl Runner {
                         LibrespotCommand::Pause => player.pause(),
                         LibrespotCommand::Next => {
                             if let Some(ref s) = spirc {
+                                let _ = s.activate().map_err(|e| log::warn!("Failed to activate Spirc before Next: {:?}", e));
                                 let _ = s.next().map_err(|e| log::error!("Spirc Next failed: {:?}", e));
                             } else {
                                 log::warn!("Next command ignored: No active Spirc session");
@@ -519,6 +520,7 @@ impl Runner {
                         }
                         LibrespotCommand::Prev => {
                             if let Some(ref s) = spirc {
+                                let _ = s.activate().map_err(|e| log::warn!("Failed to activate Spirc before Previous: {:?}", e));
                                 let _ = s.prev().map_err(|e| log::error!("Spirc Prev failed: {:?}", e));
                             } else {
                                 log::warn!("Previous command ignored: No active Spirc session");
