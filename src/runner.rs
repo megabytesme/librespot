@@ -10,23 +10,24 @@ use librespot_core::{
     FileId, Session, SessionConfig, SpotifyId, SpotifyUri, authentication::Credentials,
     cache::Cache, config::DeviceType,
 };
+use librespot_discovery::Discovery;
+use librespot_metadata::audio::{AudioFileFormat, AudioItem};
 use librespot_metadata::{
     Album as LibrespotAlbum, Artist as LibrespotArtist, Episode as LibrespotEpisode,
     Lyrics as LibrespotLyrics, Metadata, Playlist as LibrespotPlaylist, Show as LibrespotShow,
-    Track as LibrespotTrack, playlist::annotation::PlaylistAnnotation as LibrespotPlaylistAnnotation,
+    Track as LibrespotTrack,
+    playlist::annotation::PlaylistAnnotation as LibrespotPlaylistAnnotation,
+};
+use librespot_playback::{
+    config::{AudioFormat, PlayerConfig},
+    mixer::{self, MixerConfig},
+    player::{OfflineTrackMetadata, Player, PlayerEvent},
 };
 use librespot_protocol::{
     autoplay_context_request::AutoplayContextRequest, context::Context,
     playlist4_external::SelectedListContent,
 };
 use protobuf::Message;
-use librespot_discovery::Discovery;
-use librespot_metadata::audio::{AudioFileFormat, AudioItem};
-use librespot_playback::{
-    config::{AudioFormat, PlayerConfig},
-    mixer::{self, MixerConfig},
-    player::{OfflineTrackMetadata, Player, PlayerEvent},
-};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -34,10 +35,14 @@ use std::io::ErrorKind;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::mpsc as std_mpsc;
-use std::sync::{Arc, atomic::AtomicU8};
-use std::{ffi::{CString, c_char}, path::PathBuf, sync::atomic::AtomicUsize};
+use std::sync::{Arc, Mutex, atomic::AtomicU8};
+use std::{
+    ffi::{CString, c_char},
+    path::PathBuf,
+    sync::atomic::AtomicUsize,
+};
 use std::{mem::ManuallyDrop, pin::Pin};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{Duration, Instant, sleep, sleep_until};
 
 #[derive(Debug)]
@@ -116,6 +121,225 @@ struct OfflineTrackIndexEntry {
     is_explicit: bool,
 }
 
+type SharedOfflineIndex = Arc<Mutex<HashMap<String, OfflineTrackIndexEntry>>>;
+
+struct TrackPersistenceWorker {
+    session: Session,
+    cache: Arc<Cache>,
+    offline_index: SharedOfflineIndex,
+    offline_index_path: PathBuf,
+    download_gate: Arc<Semaphore>,
+    lyrics_volatile_dir: PathBuf,
+    lyrics_persisted_dir: PathBuf,
+    preferred_formats: [AudioFileFormat; 7],
+}
+
+impl TrackPersistenceWorker {
+    async fn set_track_persisted_async(
+        &self,
+        track_uri: &str,
+        persisted: bool,
+    ) -> Result<(), librespot_core::Error> {
+        if !persisted {
+            self.remove_track_persistence(track_uri)?;
+            Runner::remove_cached_lyrics_from(
+                track_uri,
+                &self.lyrics_volatile_dir,
+                &self.lyrics_persisted_dir,
+            );
+            return Ok(());
+        }
+
+        let _permit = self
+            .download_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|err| librespot_core::Error::cancelled(err.to_string()))?;
+
+        let parsed_uri = SpotifyUri::from_uri(track_uri)?;
+        let track_id: librespot_core::SpotifyId = (&parsed_uri).try_into().map_err(|_| {
+            librespot_core::Error::invalid_argument("track URI is not a playable Spotify track")
+        })?;
+        let audio_item = AudioItem::get_file(&self.session, parsed_uri).await?;
+        let (format, file_id) = self
+            .preferred_formats
+            .iter()
+            .find_map(|format| {
+                audio_item
+                    .files
+                    .get(format)
+                    .copied()
+                    .map(|file_id| (*format, file_id))
+            })
+            .ok_or_else(|| {
+                librespot_core::Error::unavailable("track has no supported audio file")
+            })?;
+
+        let already_persisted = self
+            .cache
+            .persisted_file_path(file_id)
+            .map(|path| path.exists())
+            .unwrap_or(false);
+
+        if already_persisted {
+            self.store_persisted_track(track_uri, &audio_item, format, file_id)?;
+            let _ = Runner::move_cached_lyrics_in(
+                track_uri,
+                true,
+                &self.lyrics_volatile_dir,
+                &self.lyrics_persisted_dir,
+            );
+            let _ = Runner::prefetch_lyrics_payload_for(
+                &self.session,
+                track_uri,
+                &self.offline_index,
+                &self.lyrics_volatile_dir,
+                &self.lyrics_persisted_dir,
+            )
+            .await;
+            return Ok(());
+        }
+
+        let bytes_per_second = 40 * 1024;
+        let audio_file =
+            librespot_audio::AudioFile::open(&self.session, file_id, bytes_per_second).await?;
+        let controller = audio_file.get_stream_loader_controller()?;
+        controller.set_random_access_mode();
+
+        let _key = self.session.audio_key().request(track_id, file_id).await?;
+        log::info!("Fetched audio key while persisting track <{}>", track_uri);
+
+        let total_len = controller.len();
+        let chunk_len = 256 * 1024;
+        tokio::task::spawn_blocking(move || {
+            let mut offset = 0;
+            while offset < total_len {
+                let remaining = total_len - offset;
+                let next_len = std::cmp::min(chunk_len, remaining);
+                controller.fetch_blocking(Range::new(offset, next_len))?;
+                offset += next_len;
+            }
+
+            Ok::<(), librespot_core::Error>(())
+        })
+        .await
+        .map_err(|err| librespot_core::Error::cancelled(err.to_string()))??;
+
+        for _ in 0..100 {
+            if self.cache.file(file_id).is_some() {
+                self.cache.set_persisted(file_id, true)?;
+                self.store_persisted_track(track_uri, &audio_item, format, file_id)?;
+
+                let _ = Runner::move_cached_lyrics_in(
+                    track_uri,
+                    true,
+                    &self.lyrics_volatile_dir,
+                    &self.lyrics_persisted_dir,
+                );
+
+                let _ = Runner::prefetch_lyrics_payload_for(
+                    &self.session,
+                    track_uri,
+                    &self.offline_index,
+                    &self.lyrics_volatile_dir,
+                    &self.lyrics_persisted_dir,
+                )
+                .await;
+
+                return Ok(());
+            }
+
+            sleep(Duration::from_millis(100)).await;
+        }
+
+        Err(librespot_core::Error::deadline_exceeded(
+            "timed out waiting for cached track file",
+        ))
+    }
+
+    fn remove_track_persistence(&self, track_uri: &str) -> Result<(), librespot_core::Error> {
+        let file_id = self
+            .offline_index
+            .lock()
+            .map_err(|err| librespot_core::Error::failed_precondition(err.to_string()))?
+            .get(track_uri)
+            .and_then(|entry| parse_file_id_hex(&entry.file_id_hex));
+
+        if let Some(file_id) = file_id {
+            let is_persisted = self
+                .cache
+                .persisted_file_path(file_id)
+                .map(|path| path.exists())
+                .unwrap_or(false);
+
+            if is_persisted {
+                self.cache.set_persisted(file_id, false)?;
+            }
+        }
+
+        self.update_index(|index| {
+            index.remove(track_uri);
+        })
+    }
+
+    fn store_persisted_track(
+        &self,
+        track_uri: &str,
+        audio_item: &AudioItem,
+        format: AudioFileFormat,
+        file_id: FileId,
+    ) -> Result<(), librespot_core::Error> {
+        let artist = match &audio_item.unique_fields {
+            librespot_metadata::audio::UniqueFields::Track { artists, .. } => artists
+                .0
+                .first()
+                .map(|artist| artist.name.clone())
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        let album = match &audio_item.unique_fields {
+            librespot_metadata::audio::UniqueFields::Track { album, .. } => album.clone(),
+            _ => String::new(),
+        };
+        let cover_url = audio_item
+            .covers
+            .first()
+            .map(|cover| cover.url.clone())
+            .unwrap_or_default();
+
+        self.update_index(|index| {
+            index.insert(
+                track_uri.to_owned(),
+                OfflineTrackIndexEntry {
+                    track_uri: track_uri.to_owned(),
+                    file_id_hex: file_id.to_string(),
+                    format: format as i32,
+                    name: audio_item.name.clone(),
+                    artist,
+                    album,
+                    cover_url,
+                    duration_ms: audio_item.duration_ms,
+                    is_explicit: audio_item.is_explicit,
+                },
+            );
+        })
+    }
+
+    fn update_index<F>(&self, update: F) -> Result<(), librespot_core::Error>
+    where
+        F: FnOnce(&mut HashMap<String, OfflineTrackIndexEntry>),
+    {
+        let mut index = self
+            .offline_index
+            .lock()
+            .map_err(|err| librespot_core::Error::failed_precondition(err.to_string()))?;
+        update(&mut index);
+        save_offline_index(&self.offline_index_path, &index);
+        Ok(())
+    }
+}
+
 pub struct RunnerState {
     pub is_playing: AtomicBool,
     pub shuffle: AtomicBool,
@@ -163,7 +387,8 @@ pub struct Runner {
     user_data: UserDataWrapper,
     pub state: Arc<RunnerState>,
     offline_index_path: PathBuf,
-    offline_index: HashMap<String, OfflineTrackIndexEntry>,
+    offline_index: SharedOfflineIndex,
+    download_gate: Arc<Semaphore>,
     lyrics_volatile_dir: PathBuf,
     lyrics_persisted_dir: PathBuf,
 }
@@ -178,7 +403,7 @@ impl Runner {
         state: Arc<RunnerState>,
     ) -> Self {
         let offline_index_path = setup.persisted_cache_dir.join("offline-index.json");
-        let offline_index = load_offline_index(&offline_index_path);
+        let offline_index = Arc::new(Mutex::new(load_offline_index(&offline_index_path)));
         let lyrics_volatile_dir = setup.cache_dir.join("lyrics");
         let lyrics_persisted_dir = setup.persisted_cache_dir.join("lyrics");
         Self {
@@ -190,6 +415,7 @@ impl Runner {
             state,
             offline_index_path,
             offline_index,
+            download_gate: Arc::new(Semaphore::new(1)),
             lyrics_volatile_dir,
             lyrics_persisted_dir,
         }
@@ -337,7 +563,12 @@ impl Runner {
                                 } else {
                                     let track_to_load = start_from_uri.unwrap_or(context_uri);
                                     if let Ok(t_uri) = SpotifyUri::from_uri(&track_to_load) {
-                                        if let Some(entry) = self.offline_index.get(&track_to_load) {
+                                        let entry = self
+                                            .offline_index
+                                            .lock()
+                                            .ok()
+                                            .and_then(|index| index.get(&track_to_load).cloned());
+                                        if let Some(entry) = entry {
                                             if let Some(file_id) = parse_file_id_hex(&entry.file_id_hex) {
                                                 if let Ok(format) = AudioFileFormat::try_from(entry.format) {
                                                     player.load_offline(
@@ -376,24 +607,29 @@ impl Runner {
                             spirc_task = None;
                         }
                         LibrespotCommand::SetTrackPersisted { track_uri, persisted, result_tx } => {
-                            let result = self.set_track_persisted_async(&session, &track_uri, persisted).await;
-                            if result.is_ok() {
-                                if persisted {
-                                    let _ = self.prefetch_lyrics_payload(&session, &track_uri).await;
-                                    let _ = self.move_cached_lyrics(&track_uri, true);
-                                } else {
-                                    self.remove_cached_lyrics(&track_uri);
+                            let worker = TrackPersistenceWorker {
+                                session: session.clone(),
+                                cache: self.cache.clone(),
+                                offline_index: self.offline_index.clone(),
+                                offline_index_path: self.offline_index_path.clone(),
+                                download_gate: self.download_gate.clone(),
+                                lyrics_volatile_dir: self.lyrics_volatile_dir.clone(),
+                                lyrics_persisted_dir: self.lyrics_persisted_dir.clone(),
+                                preferred_formats: self.preferred_formats(),
+                            };
+
+                            tokio::spawn(async move {
+                                let result = worker.set_track_persisted_async(&track_uri, persisted).await;
+                                if let Err(ref err) = result {
+                                    log::error!(
+                                        "Failed to set persisted={} for track <{}>: {:?}",
+                                        persisted,
+                                        track_uri,
+                                        err
+                                    );
                                 }
-                            }
-                            if let Err(ref err) = result {
-                                log::error!(
-                                    "Failed to set persisted={} for track <{}>: {:?}",
-                                    persisted,
-                                    track_uri,
-                                    err
-                                );
-                            }
-                            let _ = result_tx.send(result.is_ok());
+                                let _ = result_tx.send(result.is_ok());
+                            });
                         }
                         LibrespotCommand::GetAppData { kind, argument, result_tx } => {
                             let result = self
@@ -421,7 +657,22 @@ impl Runner {
 
                 Some(event) = player_rx.recv() => {
                     if let PlayerEvent::TrackChanged { ref audio_item } = event {
-                        let _ = self.prefetch_lyrics_payload(&session, &audio_item.uri).await;
+                        let track_uri = audio_item.uri.clone();
+                        let lyrics_session = session.clone();
+                        let offline_index = self.offline_index.clone();
+                        let volatile_dir = self.lyrics_volatile_dir.clone();
+                        let persisted_dir = self.lyrics_persisted_dir.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) = Self::prefetch_lyrics_payload_for(
+                                &lyrics_session,
+                                &track_uri,
+                                &offline_index,
+                                &volatile_dir,
+                                &persisted_dir,
+                            ).await {
+                                log::debug!("Unable to prefetch lyrics for {}: {:?}", track_uri, err);
+                            }
+                        });
                     }
 
                     self.handle_player_event(event);
@@ -512,11 +763,9 @@ impl Runner {
         key_save_callback: Option<librespot_core::LibrespotKeySaveCallback>,
         user_data: *mut std::ffi::c_void,
     ) {
-        session.audio_key().set_ffi_hooks(
-            key_callback,
-            key_save_callback,
-            user_data,
-        );
+        session
+            .audio_key()
+            .set_ffi_hooks(key_callback, key_save_callback, user_data);
         log::info!("Attached frontend audio-key hooks to session");
     }
 
@@ -819,103 +1068,6 @@ impl Runner {
         }
     }
 
-    async fn set_track_persisted_async(
-        &mut self,
-        session: &Session,
-        track_uri: &str,
-        persisted: bool,
-    ) -> Result<(), librespot_core::Error> {
-        let parsed_uri = SpotifyUri::from_uri(track_uri)?;
-        let track_id: librespot_core::SpotifyId = (&parsed_uri)
-            .try_into()
-            .map_err(|_| librespot_core::Error::invalid_argument("track URI is not a playable Spotify track"))?;
-        let audio_item = AudioItem::get_file(session, parsed_uri).await?;
-        let (format, file_id) = self
-            .preferred_formats()
-            .iter()
-            .find_map(|format| {
-                audio_item
-                    .files
-                    .get(format)
-                    .copied()
-                    .map(|file_id| (*format, file_id))
-            })
-            .ok_or_else(|| {
-                librespot_core::Error::unavailable("track has no supported audio file")
-            })?;
-
-        if !persisted {
-            self.cache.set_persisted(file_id, false)?;
-            self.offline_index.remove(track_uri);
-            save_offline_index(&self.offline_index_path, &self.offline_index);
-            return Ok(());
-        }
-
-        let bytes_per_second = 40 * 1024;
-        let audio_file =
-            librespot_audio::AudioFile::open(session, file_id, bytes_per_second).await?;
-        let controller = audio_file.get_stream_loader_controller()?;
-        controller.set_random_access_mode();
-
-        let _key = session.audio_key().request(track_id, file_id).await?;
-        log::info!("Fetched audio key while persisting track <{}>", track_uri);
-
-        let total_len = controller.len();
-        let chunk_len = 256 * 1024;
-        let mut offset = 0;
-        while offset < total_len {
-            let remaining = total_len - offset;
-            let next_len = std::cmp::min(chunk_len, remaining);
-            controller.fetch_blocking(Range::new(offset, next_len))?;
-            offset += next_len;
-        }
-
-        for _ in 0..100 {
-            if self.cache.file(file_id).is_some() {
-                self.cache.set_persisted(file_id, true)?;
-                let artist = match &audio_item.unique_fields {
-                    librespot_metadata::audio::UniqueFields::Track { artists, .. } => artists
-                        .0
-                        .first()
-                        .map(|artist| artist.name.clone())
-                        .unwrap_or_default(),
-                    _ => String::new(),
-                };
-                let album = match &audio_item.unique_fields {
-                    librespot_metadata::audio::UniqueFields::Track { album, .. } => album.clone(),
-                    _ => String::new(),
-                };
-                let cover_url = audio_item
-                    .covers
-                    .first()
-                    .map(|cover| cover.url.clone())
-                    .unwrap_or_default();
-                self.offline_index.insert(
-                    track_uri.to_owned(),
-                    OfflineTrackIndexEntry {
-                        track_uri: track_uri.to_owned(),
-                        file_id_hex: file_id.to_string(),
-                        format: format as i32,
-                        name: audio_item.name.clone(),
-                        artist,
-                        album,
-                        cover_url,
-                        duration_ms: audio_item.duration_ms,
-                        is_explicit: audio_item.is_explicit,
-                    },
-                );
-                save_offline_index(&self.offline_index_path, &self.offline_index);
-                return Ok(());
-            }
-
-            sleep(Duration::from_millis(100)).await;
-        }
-
-        Err(librespot_core::Error::deadline_exceeded(
-            "timed out waiting for cached track file",
-        ))
-    }
-
     async fn get_app_data(
         &self,
         session: &Session,
@@ -938,30 +1090,38 @@ impl Runner {
             ),
             8 => AppDataPayload::Search(self.fetch_search_payload(session, argument).await?),
             9 => AppDataPayload::FollowedArtists(
-                self.fetch_followed_artists_payload(session, argument).await?,
+                self.fetch_followed_artists_payload(session, argument)
+                    .await?,
             ),
             10 => AppDataPayload::Lyrics(self.fetch_lyrics_payload(session, argument).await?),
             11 => AppDataPayload::LyricsForImage(
-                self.fetch_lyrics_for_image_payload(session, argument).await?,
+                self.fetch_lyrics_for_image_payload(session, argument)
+                    .await?,
             ),
             12 => AppDataPayload::Episode(self.fetch_episode_payload(session, argument).await?),
             13 => AppDataPayload::Show(self.fetch_show_payload(session, argument).await?),
             14 => AppDataPayload::PlaylistAnnotation(
-                self.fetch_playlist_annotation_payload(session, argument).await?,
+                self.fetch_playlist_annotation_payload(session, argument)
+                    .await?,
             ),
             15 => AppDataPayload::UserFollowersJson(
-                self.fetch_user_followers_json_payload(session, argument).await?,
+                self.fetch_user_followers_json_payload(session, argument)
+                    .await?,
             ),
             16 => AppDataPayload::UserFollowingJson(
-                self.fetch_user_following_json_payload(session, argument).await?,
+                self.fetch_user_following_json_payload(session, argument)
+                    .await?,
             ),
             17 => AppDataPayload::RadioForTrackJson(
-                self.fetch_radio_for_track_payload(session, argument).await?,
+                self.fetch_radio_for_track_payload(session, argument)
+                    .await?,
             ),
             18 => AppDataPayload::ApolloStationJson(
                 self.fetch_apollo_station_payload(session, argument).await?,
             ),
-            19 => AppDataPayload::NextPageJson(self.fetch_next_page_payload(session, argument).await?),
+            19 => {
+                AppDataPayload::NextPageJson(self.fetch_next_page_payload(session, argument).await?)
+            }
             20 => AppDataPayload::AudioStorageJson(
                 self.fetch_audio_storage_payload(session, argument).await?,
             ),
@@ -974,9 +1134,12 @@ impl Runner {
             23 => AppDataPayload::ImageBinary(self.fetch_image_payload(session, argument).await?),
             24 => AppDataPayload::ContextJson(self.fetch_context_payload(session, argument).await?),
             25 => AppDataPayload::AutoplayContextJson(
-                self.fetch_autoplay_context_payload(session, argument).await?,
+                self.fetch_autoplay_context_payload(session, argument)
+                    .await?,
             ),
-            26 => AppDataPayload::RootlistJson(self.fetch_rootlist_payload(session, argument).await?),
+            26 => {
+                AppDataPayload::RootlistJson(self.fetch_rootlist_payload(session, argument).await?)
+            }
             _ => {
                 return Err(librespot_core::Error::invalid_argument(
                     "unknown app data request kind",
@@ -1181,7 +1344,11 @@ impl Runner {
         }
     }
 
-    fn map_track_payload(&self, track: &LibrespotTrack, album: AlbumSummaryPayload) -> TrackPayload {
+    fn map_track_payload(
+        &self,
+        track: &LibrespotTrack,
+        album: AlbumSummaryPayload,
+    ) -> TrackPayload {
         TrackPayload {
             id: track.id.to_id(),
             uri: track.id.to_uri(),
@@ -1228,11 +1395,12 @@ impl Runner {
         images
             .iter()
             .filter_map(|image| {
-                self.image_url_for(session, &image.id).map(|url| ImagePayload {
-                    url,
-                    width: image.width,
-                    height: image.height,
-                })
+                self.image_url_for(session, &image.id)
+                    .map(|url| ImagePayload {
+                        url,
+                        width: image.width,
+                        height: image.height,
+                    })
             })
             .collect()
     }
@@ -1303,7 +1471,8 @@ impl Runner {
                     "Rootlist returned no playlists for <{}>; falling back to profile playlist discovery",
                     username
                 );
-                self.fetch_user_playlists_from_profile(session, &username).await
+                self.fetch_user_playlists_from_profile(session, &username)
+                    .await
             }
             Err(err) => {
                 log::warn!(
@@ -1311,7 +1480,8 @@ impl Runner {
                     username,
                     err
                 );
-                self.fetch_user_playlists_from_profile(session, &username).await
+                self.fetch_user_playlists_from_profile(session, &username)
+                    .await
             }
         }
     }
@@ -1325,7 +1495,8 @@ impl Runner {
             .spclient()
             .get_rootlist_for_user(username, 0, Some(200))
             .await?;
-        self.map_playlist_list_payload_from_bytes(session, &bytes, 200).await
+        self.map_playlist_list_payload_from_bytes(session, &bytes, 200)
+            .await
     }
 
     async fn fetch_user_playlists_from_profile(
@@ -1337,7 +1508,8 @@ impl Runner {
             .spclient()
             .get_user_profile(username, Some(200), None)
             .await?;
-        self.map_playlist_list_payload_from_bytes(session, &bytes, 200).await
+        self.map_playlist_list_payload_from_bytes(session, &bytes, 200)
+            .await
     }
 
     async fn map_playlist_list_payload_from_bytes(
@@ -1363,33 +1535,34 @@ impl Runner {
                 uris
             }
             Err(proto_err) => match serde_json::from_slice::<serde_json::Value>(bytes) {
-            Ok(value) => {
-                let mut uris = Vec::new();
-                let mut seen = std::collections::HashSet::new();
-                Self::collect_json_spotify_uris_in_order(
-                    &value,
-                    "spotify:playlist:",
-                    &mut uris,
-                    &mut seen,
-                );
-                uris
-            }
-            Err(err) => {
-                let preview = String::from_utf8_lossy(bytes)
-                    .chars()
-                    .take(240)
-                    .collect::<String>()
-                    .replace('\r', "\\r")
-                    .replace('\n', "\\n");
-                log::warn!(
-                    "Failed to parse playlist list payload as protobuf ({}) or JSON ({}). Preview: {}",
-                    proto_err,
-                    err,
-                    preview
-                );
-                Self::extract_spotify_uris_from_bytes(bytes, "spotify:playlist:")
-            }
-        }};
+                Ok(value) => {
+                    let mut uris = Vec::new();
+                    let mut seen = std::collections::HashSet::new();
+                    Self::collect_json_spotify_uris_in_order(
+                        &value,
+                        "spotify:playlist:",
+                        &mut uris,
+                        &mut seen,
+                    );
+                    uris
+                }
+                Err(err) => {
+                    let preview = String::from_utf8_lossy(bytes)
+                        .chars()
+                        .take(240)
+                        .collect::<String>()
+                        .replace('\r', "\\r")
+                        .replace('\n', "\\n");
+                    log::warn!(
+                        "Failed to parse playlist list payload as protobuf ({}) or JSON ({}). Preview: {}",
+                        proto_err,
+                        err,
+                        preview
+                    );
+                    Self::extract_spotify_uris_from_bytes(bytes, "spotify:playlist:")
+                }
+            },
+        };
 
         if uris.is_empty() {
             return Err(librespot_core::Error::failed_precondition(
@@ -1499,7 +1672,10 @@ impl Runner {
                     .collect::<String>()
                     .replace('\r', "\\r")
                     .replace('\n', "\\n");
-                log::warn!("Failed to parse followed artists payload. Preview: {}", preview);
+                log::warn!(
+                    "Failed to parse followed artists payload. Preview: {}",
+                    preview
+                );
                 Self::extract_spotify_uris_from_bytes(bytes.as_ref(), "spotify:artist:")
             }
         };
@@ -1556,7 +1732,7 @@ impl Runner {
 
         let track_id = Self::parse_track_id(track_uri)?;
         let lyrics = LibrespotLyrics::get(session, &track_id).await?;
-        let payload = self.map_lyrics_payload(&lyrics);
+        let payload = Self::map_lyrics_payload(&lyrics);
         self.write_cached_lyrics(track_uri, &payload)?;
         Ok(payload)
     }
@@ -1569,31 +1745,18 @@ impl Runner {
         let request: LyricsForImageRequest = serde_json::from_str(argument)
             .map_err(|err| librespot_core::Error::invalid_argument(err.to_string()))?;
         if let Some(cached) = self.read_cached_lyrics(&request.track_uri)? {
-            log::info!("Returning cached lyrics for {} (image variant request)", request.track_uri);
+            log::info!(
+                "Returning cached lyrics for {} (image variant request)",
+                request.track_uri
+            );
             return Ok(cached);
         }
         let track_id = Self::parse_track_id(&request.track_uri)?;
         let image_id = Self::parse_file_id(&request.image_id_hex)?;
         let lyrics = LibrespotLyrics::get_for_image(session, &track_id, &image_id).await?;
-        let payload = self.map_lyrics_payload(&lyrics);
+        let payload = Self::map_lyrics_payload(&lyrics);
         self.write_cached_lyrics(&request.track_uri, &payload)?;
         Ok(payload)
-    }
-
-    async fn prefetch_lyrics_payload(
-        &self,
-        session: &Session,
-        track_uri: &str,
-    ) -> Result<(), librespot_core::Error> {
-        if self.read_cached_lyrics(track_uri)?.is_some() {
-            return Ok(());
-        }
-
-        let track_id = Self::parse_track_id(track_uri)?;
-        let lyrics = LibrespotLyrics::get(session, &track_id).await?;
-        let payload = self.map_lyrics_payload(&lyrics);
-        self.write_cached_lyrics(track_uri, &payload)?;
-        Ok(())
     }
 
     async fn fetch_episode_payload(
@@ -1705,7 +1868,11 @@ impl Runner {
     ) -> Result<BinaryPayload, librespot_core::Error> {
         let file_id = Self::parse_file_id(preview_id_hex)?;
         let bytes = session.spclient().get_audio_preview(&file_id).await?;
-        Ok(Self::binary_payload(preview_id_hex, "audio/mpeg", bytes.as_ref()))
+        Ok(Self::binary_payload(
+            preview_id_hex,
+            "audio/mpeg",
+            bytes.as_ref(),
+        ))
     }
 
     async fn fetch_head_file_payload(
@@ -1729,7 +1896,11 @@ impl Runner {
     ) -> Result<BinaryPayload, librespot_core::Error> {
         let file_id = Self::parse_file_id(image_id_hex)?;
         let bytes = session.spclient().get_image(&file_id).await?;
-        Ok(Self::binary_payload(image_id_hex, "image/jpeg", bytes.as_ref()))
+        Ok(Self::binary_payload(
+            image_id_hex,
+            "image/jpeg",
+            bytes.as_ref(),
+        ))
     }
 
     async fn fetch_context_payload(
@@ -1750,11 +1921,13 @@ impl Runner {
             .map_err(|err| librespot_core::Error::invalid_argument(err.to_string()))?;
         let request_json = serde_json::to_string(&request)
             .map_err(|err| librespot_core::Error::invalid_argument(err.to_string()))?;
-        let proto_request = protobuf_json_mapping::parse_from_str::<AutoplayContextRequest>(
-            &request_json,
-        )
-        .map_err(|err| librespot_core::Error::failed_precondition(err.to_string()))?;
-        let context = session.spclient().get_autoplay_context(&proto_request).await?;
+        let proto_request =
+            protobuf_json_mapping::parse_from_str::<AutoplayContextRequest>(&request_json)
+                .map_err(|err| librespot_core::Error::failed_precondition(err.to_string()))?;
+        let context = session
+            .spclient()
+            .get_autoplay_context(&proto_request)
+            .await?;
         Self::json_payload_from_context(&context)
     }
 
@@ -1960,9 +2133,7 @@ impl Runner {
         }
     }
 
-    fn json_payload_from_bytes(
-        bytes: bytes::Bytes,
-    ) -> Result<JsonPayload, librespot_core::Error> {
+    fn json_payload_from_bytes(bytes: bytes::Bytes) -> Result<JsonPayload, librespot_core::Error> {
         let value = serde_json::from_slice(bytes.as_ref()).map_err(|err| {
             let preview = String::from_utf8_lossy(bytes.as_ref())
                 .chars()
@@ -1976,9 +2147,7 @@ impl Runner {
         Ok(JsonPayload { value })
     }
 
-    fn json_payload_from_context(
-        context: &Context,
-    ) -> Result<JsonPayload, librespot_core::Error> {
+    fn json_payload_from_context(context: &Context) -> Result<JsonPayload, librespot_core::Error> {
         let json = protobuf_json_mapping::print_to_string(context)
             .map_err(|err| librespot_core::Error::failed_precondition(err.to_string()))?;
         let value = serde_json::from_str(&json)
@@ -1995,7 +2164,7 @@ impl Runner {
         }
     }
 
-    fn map_lyrics_payload(&self, lyrics: &LibrespotLyrics) -> LyricsPayload {
+    fn map_lyrics_payload(lyrics: &LibrespotLyrics) -> LyricsPayload {
         LyricsPayload {
             provider: lyrics.lyrics.provider.clone(),
             provider_display_name: lyrics.lyrics.provider_display_name.clone(),
@@ -2023,32 +2192,60 @@ impl Runner {
         }
     }
 
-    fn is_track_persisted(&self, track_uri: &str) -> bool {
-        self.offline_index.contains_key(track_uri)
+    fn is_track_persisted_in(offline_index: &SharedOfflineIndex, track_uri: &str) -> bool {
+        offline_index
+            .lock()
+            .map(|index| index.contains_key(track_uri))
+            .unwrap_or(false)
     }
 
-    fn lyrics_path(&self, track_uri: &str, persisted: bool) -> PathBuf {
+    fn lyrics_path_for(
+        track_uri: &str,
+        persisted: bool,
+        volatile_dir: &PathBuf,
+        persisted_dir: &PathBuf,
+    ) -> PathBuf {
         let root = if persisted {
-            &self.lyrics_persisted_dir
+            persisted_dir
         } else {
-            &self.lyrics_volatile_dir
+            volatile_dir
         };
-        root.join(format!("{}.lyrics.json", Self::sha1_hex(track_uri.as_bytes())))
+        root.join(format!(
+            "{}.lyrics.json",
+            Self::sha1_hex(track_uri.as_bytes())
+        ))
     }
 
     fn read_cached_lyrics(
         &self,
         track_uri: &str,
     ) -> Result<Option<LyricsPayload>, librespot_core::Error> {
-        let preferred_persisted = self.is_track_persisted(track_uri);
-        let primary = self.lyrics_path(track_uri, preferred_persisted);
-        let secondary = self.lyrics_path(track_uri, !preferred_persisted);
+        Self::read_cached_lyrics_from(
+            track_uri,
+            &self.offline_index,
+            &self.lyrics_volatile_dir,
+            &self.lyrics_persisted_dir,
+        )
+    }
+
+    fn read_cached_lyrics_from(
+        track_uri: &str,
+        offline_index: &SharedOfflineIndex,
+        volatile_dir: &PathBuf,
+        persisted_dir: &PathBuf,
+    ) -> Result<Option<LyricsPayload>, librespot_core::Error> {
+        let preferred_persisted = Self::is_track_persisted_in(offline_index, track_uri);
+        let primary =
+            Self::lyrics_path_for(track_uri, preferred_persisted, volatile_dir, persisted_dir);
+        let secondary =
+            Self::lyrics_path_for(track_uri, !preferred_persisted, volatile_dir, persisted_dir);
 
         for path in [primary, secondary] {
             match fs::read_to_string(&path) {
                 Ok(json) => {
-                    let payload = serde_json::from_str::<LyricsPayload>(&json)
-                        .map_err(|err| librespot_core::Error::failed_precondition(err.to_string()))?;
+                    let payload = serde_json::from_str::<LyricsPayload>(&json).map_err(|err| {
+                        librespot_core::Error::failed_precondition(err.to_string())
+                    })?;
                     return Ok(Some(payload));
                 }
                 Err(err) if err.kind() == ErrorKind::NotFound => continue,
@@ -2066,9 +2263,25 @@ impl Runner {
         track_uri: &str,
         payload: &LyricsPayload,
     ) -> Result<(), librespot_core::Error> {
-        let persisted = self.is_track_persisted(track_uri);
-        let target = self.lyrics_path(track_uri, persisted);
-        let alternate = self.lyrics_path(track_uri, !persisted);
+        Self::write_cached_lyrics_to(
+            track_uri,
+            payload,
+            &self.offline_index,
+            &self.lyrics_volatile_dir,
+            &self.lyrics_persisted_dir,
+        )
+    }
+
+    fn write_cached_lyrics_to(
+        track_uri: &str,
+        payload: &LyricsPayload,
+        offline_index: &SharedOfflineIndex,
+        volatile_dir: &PathBuf,
+        persisted_dir: &PathBuf,
+    ) -> Result<(), librespot_core::Error> {
+        let persisted = Self::is_track_persisted_in(offline_index, track_uri);
+        let target = Self::lyrics_path_for(track_uri, persisted, volatile_dir, persisted_dir);
+        let alternate = Self::lyrics_path_for(track_uri, !persisted, volatile_dir, persisted_dir);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)
                 .map_err(|err| librespot_core::Error::failed_precondition(err.to_string()))?;
@@ -2081,13 +2294,14 @@ impl Runner {
         Ok(())
     }
 
-    fn move_cached_lyrics(
-        &self,
+    fn move_cached_lyrics_in(
         track_uri: &str,
         persisted: bool,
+        volatile_dir: &PathBuf,
+        persisted_dir: &PathBuf,
     ) -> Result<(), librespot_core::Error> {
-        let source = self.lyrics_path(track_uri, !persisted);
-        let target = self.lyrics_path(track_uri, persisted);
+        let source = Self::lyrics_path_for(track_uri, !persisted, volatile_dir, persisted_dir);
+        let target = Self::lyrics_path_for(track_uri, persisted, volatile_dir, persisted_dir);
         if !source.exists() {
             return Ok(());
         }
@@ -2105,9 +2319,45 @@ impl Runner {
         Ok(())
     }
 
-    fn remove_cached_lyrics(&self, track_uri: &str) {
-        let _ = fs::remove_file(self.lyrics_path(track_uri, false));
-        let _ = fs::remove_file(self.lyrics_path(track_uri, true));
+    fn remove_cached_lyrics_from(track_uri: &str, volatile_dir: &PathBuf, persisted_dir: &PathBuf) {
+        let _ = fs::remove_file(Self::lyrics_path_for(
+            track_uri,
+            false,
+            volatile_dir,
+            persisted_dir,
+        ));
+        let _ = fs::remove_file(Self::lyrics_path_for(
+            track_uri,
+            true,
+            volatile_dir,
+            persisted_dir,
+        ));
+    }
+
+    async fn prefetch_lyrics_payload_for(
+        session: &Session,
+        track_uri: &str,
+        offline_index: &SharedOfflineIndex,
+        volatile_dir: &PathBuf,
+        persisted_dir: &PathBuf,
+    ) -> Result<(), librespot_core::Error> {
+        if Self::read_cached_lyrics_from(track_uri, offline_index, volatile_dir, persisted_dir)?
+            .is_some()
+        {
+            return Ok(());
+        }
+
+        let track_id = Self::parse_track_id(track_uri)?;
+        let lyrics = LibrespotLyrics::get(session, &track_id).await?;
+        let payload = Self::map_lyrics_payload(&lyrics);
+        Self::write_cached_lyrics_to(
+            track_uri,
+            &payload,
+            offline_index,
+            volatile_dir,
+            persisted_dir,
+        )?;
+        Ok(())
     }
 
     fn sha1_hex(bytes: &[u8]) -> String {
@@ -2774,7 +3024,13 @@ fn build_ffi_album(payload: AlbumPayload) -> FfiAlbum {
             .map(build_ffi_artist_summary)
             .collect(),
     );
-    let (tracks, track_count) = ffi_vec(payload.tracks.into_iter().map(build_ffi_simple_track).collect());
+    let (tracks, track_count) = ffi_vec(
+        payload
+            .tracks
+            .into_iter()
+            .map(build_ffi_simple_track)
+            .collect(),
+    );
 
     FfiAlbum {
         id: ffi_string(&payload.id),
