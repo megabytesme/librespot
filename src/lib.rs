@@ -23,7 +23,7 @@ pub struct LibrespotInstance {
     cmd_tx: mpsc::UnboundedSender<LibrespotCommand>,
     state: Arc<RunnerState>,
     cache: Arc<Cache>,
-    _thread_handle: thread::JoinHandle<()>,
+    thread_handle: thread::JoinHandle<()>,
 }
 
 #[derive(Clone, Copy)]
@@ -163,7 +163,7 @@ pub unsafe extern "C" fn librespot_new(
         cmd_tx: tx,
         state: runner_state,
         cache,
-        _thread_handle: thread_handle,
+        thread_handle,
     });
 
     Box::into_raw(instance)
@@ -173,7 +173,20 @@ pub unsafe extern "C" fn librespot_new(
 pub unsafe extern "C" fn librespot_free(instance: *mut LibrespotInstance) {
     if !instance.is_null() {
         unsafe {
-            let _ = Box::from_raw(instance);
+            let instance = Box::from_raw(instance);
+            let LibrespotInstance {
+                cmd_tx,
+                state: _,
+                cache: _,
+                thread_handle,
+            } = *instance;
+
+            let _ = cmd_tx.send(LibrespotCommand::Shutdown);
+            drop(cmd_tx);
+
+            if let Err(err) = thread_handle.join() {
+                log::error!("Failed to join librespot runner thread: {:?}", err);
+            }
         }
     }
 }

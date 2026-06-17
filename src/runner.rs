@@ -48,6 +48,7 @@ use tokio::time::{Duration, Instant, sleep, sleep_until};
 #[derive(Debug)]
 #[allow(dead_code)]
 pub enum LibrespotCommand {
+    Shutdown,
     Load {
         context_uri: String,
         start_from_uri: Option<String>,
@@ -493,6 +494,14 @@ impl Runner {
             tokio::select! {
                 Some(cmd) = self.cmd_rx.recv() => {
                     match cmd {
+                        LibrespotCommand::Shutdown => {
+                            log::info!("Runner shutdown requested");
+                            player.stop();
+                            if let Some(s) = spirc.take() {
+                                let _ = s.shutdown();
+                            }
+                            break;
+                        }
                         LibrespotCommand::Stop => player.stop(),
                         LibrespotCommand::Play => {
                             if let Some(ref s) = spirc {
@@ -538,6 +547,12 @@ impl Runner {
                         }
                         LibrespotCommand::Load { context_uri, start_from_uri, play } => {
                             if let Ok(_ctx_uri) = SpotifyUri::from_uri(&context_uri) {
+                                player.stop();
+                                self.state.position_ms.store(0, Ordering::Release);
+                                self.state
+                                    .sync_write_pos
+                                    .store(librespot_playback::audio_backend::get_write_pos(), Ordering::Release);
+
                                 if let Some(ref s) = spirc {
                                     let _ = s.activate();
 
@@ -838,6 +853,11 @@ impl Runner {
             PlayerEvent::TrackChanged { audio_item } => {
                 let duration = audio_item.duration_ms as u32;
                 self.state.duration_ms.store(duration, Ordering::Relaxed);
+                self.state.position_ms.store(0, Ordering::Release);
+                self.state.sync_write_pos.store(
+                    librespot_playback::audio_backend::get_write_pos(),
+                    Ordering::Release,
+                );
 
                 let artist_name = match &audio_item.unique_fields {
                     librespot_metadata::audio::UniqueFields::Track { artists, .. } => artists
