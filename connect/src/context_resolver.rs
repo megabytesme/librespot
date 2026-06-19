@@ -211,25 +211,10 @@ impl ContextResolver {
         recent_track_uri: impl Fn() -> Vec<String>,
     ) -> Result<Context, Error> {
         let (next, resolve_uri, _) = self.find_next().ok_or(ContextResolverError::NoNext)?;
-        let profile_start = Instant::now();
-        info!(
-            "[PlaybackProfile] context_resolver:get_next_context start update={:?} resolve_uri={} context_uri={}",
-            next.update,
-            resolve_uri,
-            next.context_uri()
-        );
 
         match next.update {
             ContextType::Default => {
-                let request_start = Instant::now();
                 let mut ctx = self.session.spclient().get_context(resolve_uri).await;
-                info!(
-                    "[PlaybackProfile] context_resolver:get_next_context get_context returned success={} pages={} elapsed_ms={} total_ms={}",
-                    ctx.is_ok(),
-                    ctx.as_ref().map(|ctx| ctx.pages.len()).unwrap_or_default(),
-                    request_start.elapsed().as_millis(),
-                    profile_start.elapsed().as_millis()
-                );
                 if let Ok(ctx) = ctx.as_mut() {
                     ctx.uri = Some(next.context_uri().to_string());
                     ctx.url = ctx.uri.as_ref().map(|s| format!("context://{s}"));
@@ -251,16 +236,7 @@ impl ContextResolver {
                     recent_track_uri: recent_track_uri(),
                     ..Default::default()
                 };
-                let request_start = Instant::now();
-                let ctx = self.session.spclient().get_autoplay_context(&request).await;
-                info!(
-                    "[PlaybackProfile] context_resolver:get_next_context get_autoplay_context returned success={} pages={} elapsed_ms={} total_ms={}",
-                    ctx.is_ok(),
-                    ctx.as_ref().map(|ctx| ctx.pages.len()).unwrap_or_default(),
-                    request_start.elapsed().as_millis(),
-                    profile_start.elapsed().as_millis()
-                );
-                ctx
+                self.session.spclient().get_autoplay_context(&request).await
             }
         }
     }

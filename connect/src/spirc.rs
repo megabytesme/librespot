@@ -39,7 +39,7 @@ use std::{
     future::Future,
     sync::Arc,
     sync::atomic::{AtomicUsize, Ordering},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use tokio::{sync::mpsc, time::sleep};
@@ -1300,16 +1300,6 @@ impl SpircTask {
         page: Option<ContextPage>,
         fallback_index: Option<usize>,
     ) -> Result<(), Error> {
-        let profile_start = Instant::now();
-        let context_description = match &cmd.context {
-            PlayContext::Uri(uri) => uri.as_str(),
-            PlayContext::Tracks(_) => "(tracks)",
-        };
-        info!(
-            "[PlaybackProfile] spirc:handle_load start context={} start_playing={} seek_to={} playing_track={:?}",
-            context_description, cmd.start_playing, cmd.seek_to, cmd.playing_track
-        );
-
         self.connect_state
             .reset_context(if let PlayContext::Uri(ref uri) = cmd.context {
                 ResetContext::WhenDifferent(uri)
@@ -1318,13 +1308,8 @@ impl SpircTask {
             });
 
         self.connect_state.reset_options();
-        info!(
-            "[PlaybackProfile] spirc:handle_load context/options reset elapsed_ms={}",
-            profile_start.elapsed().as_millis()
-        );
 
         let autoplay = matches!(cmd.context_options, Some(LoadContextOptions::Autoplay));
-        let context_load_start = Instant::now();
         match cmd.context {
             PlayContext::Uri(uri) => {
                 self.load_context_from_uri(uri, page.as_ref(), autoplay)
@@ -1332,11 +1317,6 @@ impl SpircTask {
             }
             PlayContext::Tracks(tracks) => self.load_context_from_tracks(tracks)?,
         }
-        info!(
-            "[PlaybackProfile] spirc:handle_load context loaded elapsed_ms={} total_ms={}",
-            context_load_start.elapsed().as_millis(),
-            profile_start.elapsed().as_millis()
-        );
 
         let cmd_options = cmd.options;
 
@@ -1409,22 +1389,12 @@ impl SpircTask {
         }
 
         if self.connect_state.current_track(MessageField::is_some) {
-            let player_load_start = Instant::now();
             self.load_track(cmd_options.start_playing, cmd_options.seek_to)?;
-            info!(
-                "[PlaybackProfile] spirc:handle_load player load dispatched elapsed_ms={} total_ms={}",
-                player_load_start.elapsed().as_millis(),
-                profile_start.elapsed().as_millis()
-            );
         } else {
             info!("No active track, stopping");
             self.handle_stop()
         }
 
-        info!(
-            "[PlaybackProfile] spirc:handle_load complete total_ms={}",
-            profile_start.elapsed().as_millis()
-        );
         Ok(())
     }
 
@@ -1434,18 +1404,8 @@ impl SpircTask {
         page: Option<&ContextPage>,
         autoplay: bool,
     ) -> Result<(), Error> {
-        let profile_start = Instant::now();
-        info!(
-            "[PlaybackProfile] spirc:load_context_from_uri start context={} autoplay={}",
-            context_uri, autoplay
-        );
-
         if !self.connect_state.is_active() {
             self.handle_activate();
-            info!(
-                "[PlaybackProfile] spirc:load_context_from_uri activated device elapsed_ms={}",
-                profile_start.elapsed().as_millis()
-            );
         }
 
         let update_context = if autoplay {
@@ -1469,11 +1429,7 @@ impl SpircTask {
         let current_context_uri = self.connect_state.context_uri();
 
         if current_context_uri == &context_uri && fallback == context_uri {
-            debug!("context <{current_context_uri}> didn't change, no resolving required");
-            info!(
-                "[PlaybackProfile] spirc:load_context_from_uri context unchanged elapsed_ms={}",
-                profile_start.elapsed().as_millis()
-            );
+            debug!("context <{current_context_uri}> didn't change, no resolving required")
         } else {
             debug!("resolving context for load command");
             self.context_resolver.clear();
@@ -1483,27 +1439,10 @@ impl SpircTask {
                 update_context,
                 ContextAction::Replace,
             ));
-            let resolve_start = Instant::now();
             let context = self.context_resolver.get_next_context(Vec::new).await;
-            info!(
-                "[PlaybackProfile] spirc:load_context_from_uri resolver returned success={} elapsed_ms={} total_ms={}",
-                context.is_ok(),
-                resolve_start.elapsed().as_millis(),
-                profile_start.elapsed().as_millis()
-            );
-            let apply_start = Instant::now();
             self.handle_next_context(context);
-            info!(
-                "[PlaybackProfile] spirc:load_context_from_uri applied context elapsed_ms={} total_ms={}",
-                apply_start.elapsed().as_millis(),
-                profile_start.elapsed().as_millis()
-            );
         }
 
-        info!(
-            "[PlaybackProfile] spirc:load_context_from_uri complete total_ms={}",
-            profile_start.elapsed().as_millis()
-        );
         Ok(())
     }
 
@@ -1886,7 +1825,6 @@ impl SpircTask {
     }
 
     fn load_track(&mut self, start_playing: bool, position_ms: u32) -> Result<(), Error> {
-        let profile_start = Instant::now();
         if self.connect_state.current_track(MessageField::is_none) {
             debug!("current track is none, stopping playback");
             self.handle_stop();
@@ -1894,16 +1832,8 @@ impl SpircTask {
         }
 
         let current_uri = self.connect_state.current_track(|t| &t.uri);
-        info!(
-            "[PlaybackProfile] spirc:load_track start uri={} start_playing={} position_ms={}",
-            current_uri, start_playing, position_ms
-        );
         let id = SpotifyUri::from_uri(current_uri)?;
         self.player.load(id, start_playing, position_ms);
-        info!(
-            "[PlaybackProfile] spirc:load_track player.load sent elapsed_ms={}",
-            profile_start.elapsed().as_millis()
-        );
 
         self.connect_state
             .update_position(position_ms, self.now_ms());
@@ -1914,10 +1844,6 @@ impl SpircTask {
         }
         self.connect_state.set_status(&self.play_status);
 
-        info!(
-            "[PlaybackProfile] spirc:load_track complete total_ms={}",
-            profile_start.elapsed().as_millis()
-        );
         Ok(())
     }
 

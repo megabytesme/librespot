@@ -124,6 +124,15 @@ struct OfflineTrackIndexEntry {
 
 type SharedOfflineIndex = Arc<Mutex<HashMap<String, OfflineTrackIndexEntry>>>;
 
+const SLOW_APP_DATA_WARNING_MS: u128 = 3_000;
+
+#[derive(Clone)]
+struct AppDataWorker {
+    offline_index: SharedOfflineIndex,
+    lyrics_volatile_dir: PathBuf,
+    lyrics_persisted_dir: PathBuf,
+}
+
 struct TrackPersistenceWorker {
     session: Session,
     cache: Arc<Cache>,
@@ -143,7 +152,7 @@ impl TrackPersistenceWorker {
     ) -> Result<(), librespot_core::Error> {
         if !persisted {
             self.remove_track_persistence(track_uri)?;
-            Runner::remove_cached_lyrics_from(
+            AppDataWorker::remove_cached_lyrics_from(
                 track_uri,
                 &self.lyrics_volatile_dir,
                 &self.lyrics_persisted_dir,
@@ -185,13 +194,13 @@ impl TrackPersistenceWorker {
 
         if already_persisted {
             self.store_persisted_track(track_uri, &audio_item, format, file_id)?;
-            let _ = Runner::move_cached_lyrics_in(
+            let _ = AppDataWorker::move_cached_lyrics_in(
                 track_uri,
                 true,
                 &self.lyrics_volatile_dir,
                 &self.lyrics_persisted_dir,
             );
-            let _ = Runner::prefetch_lyrics_payload_for(
+            let _ = AppDataWorker::prefetch_lyrics_payload_for(
                 &self.session,
                 track_uri,
                 &self.offline_index,
@@ -232,14 +241,14 @@ impl TrackPersistenceWorker {
                 self.cache.set_persisted(file_id, true)?;
                 self.store_persisted_track(track_uri, &audio_item, format, file_id)?;
 
-                let _ = Runner::move_cached_lyrics_in(
+                let _ = AppDataWorker::move_cached_lyrics_in(
                     track_uri,
                     true,
                     &self.lyrics_volatile_dir,
                     &self.lyrics_persisted_dir,
                 );
 
-                let _ = Runner::prefetch_lyrics_payload_for(
+                let _ = AppDataWorker::prefetch_lyrics_payload_for(
                     &self.session,
                     track_uri,
                     &self.offline_index,
@@ -426,6 +435,14 @@ impl Runner {
         (self.callback)(&event, self.user_data.0);
     }
 
+    fn app_data_worker(&self) -> AppDataWorker {
+        AppDataWorker {
+            offline_index: self.offline_index.clone(),
+            lyrics_volatile_dir: self.lyrics_volatile_dir.clone(),
+            lyrics_persisted_dir: self.lyrics_persisted_dir.clone(),
+        }
+    }
+
     pub async fn run(&mut self) {
         log::info!("Runner::run() starting");
 
@@ -548,33 +565,15 @@ impl Runner {
                             }
                         }
                         LibrespotCommand::Load { context_uri, start_from_uri, play } => {
-                            let profile_start = Instant::now();
-                            log::info!(
-                                "[PlaybackProfile] runner:load command received context={} start={} play={}",
-                                context_uri,
-                                start_from_uri.as_deref().unwrap_or("(null)"),
-                                play
-                            );
-
                             if let Ok(_ctx_uri) = SpotifyUri::from_uri(&context_uri) {
                                 player.stop();
                                 self.state.position_ms.store(0, Ordering::Release);
                                 self.state
                                     .sync_write_pos
                                     .store(librespot_playback::audio_backend::get_write_pos(), Ordering::Release);
-                                log::info!(
-                                    "[PlaybackProfile] runner:load player stopped/state reset elapsed_ms={}",
-                                    profile_start.elapsed().as_millis()
-                                );
 
                                 if let Some(ref s) = spirc {
-                                    let activate_start = Instant::now();
                                     let _ = s.activate();
-                                    log::info!(
-                                        "[PlaybackProfile] runner:load spirc activate queued elapsed_ms={} total_ms={}",
-                                        activate_start.elapsed().as_millis(),
-                                        profile_start.elapsed().as_millis()
-                                    );
 
                                     let context_options = LoadContextOptions::Options(Options {
                                         shuffle: self.state.shuffle.load(Ordering::Acquire),
@@ -592,30 +591,12 @@ impl Runner {
                                     };
 
                                     let request = LoadRequest::from_context_uri(context_uri, options);
-                                    let load_start = Instant::now();
                                     if let Err(e) = s.load(request) {
                                         log::error!("Spirc load failed: {:?}", e);
-                                        log::info!(
-                                            "[PlaybackProfile] runner:load spirc load queue failed elapsed_ms={} total_ms={}",
-                                            load_start.elapsed().as_millis(),
-                                            profile_start.elapsed().as_millis()
-                                        );
-                                    } else {
-                                        log::info!(
-                                            "[PlaybackProfile] runner:load spirc load queued elapsed_ms={} total_ms={}",
-                                            load_start.elapsed().as_millis(),
-                                            profile_start.elapsed().as_millis()
-                                        );
                                     }
                                 } else {
                                     let track_to_load = start_from_uri.unwrap_or(context_uri);
                                     if let Ok(t_uri) = SpotifyUri::from_uri(&track_to_load) {
-                                        log::info!(
-                                            "[PlaybackProfile] runner:load direct player load track={} play={} elapsed_ms={}",
-                                            track_to_load,
-                                            play,
-                                            profile_start.elapsed().as_millis()
-                                        );
                                         let entry = self
                                             .offline_index
                                             .lock()
@@ -685,11 +666,34 @@ impl Runner {
                             });
                         }
                         LibrespotCommand::GetAppData { kind, argument, result_tx } => {
-                            let result = self
-                                .get_app_data(&session, kind, &argument)
-                                .await
-                                .map_err(|err| err.to_string());
-                            let _ = result_tx.send(result);
+                            let worker = self.app_data_worker();
+                            let session = session.clone();
+
+                            tokio::spawn(async move {
+                                let start = Instant::now();
+                                let result = worker
+                                    .get_app_data(&session, kind, &argument)
+                                    .await
+                                    .map_err(|err| err.to_string());
+                                let elapsed_ms = start.elapsed().as_millis();
+
+                                if let Err(err) = &result {
+                                    log::warn!(
+                                        "librespot app data request kind={} failed after {}ms: {}",
+                                        kind,
+                                        elapsed_ms,
+                                        err
+                                    );
+                                } else if elapsed_ms >= SLOW_APP_DATA_WARNING_MS {
+                                    log::warn!(
+                                        "slow librespot app data request kind={} elapsed_ms={}",
+                                        kind,
+                                        elapsed_ms
+                                    );
+                                }
+
+                                let _ = result_tx.send(result);
+                            });
                         }
                         LibrespotCommand::StartDiscovery => {
                             if discovery.is_none() {
@@ -716,7 +720,7 @@ impl Runner {
                         let volatile_dir = self.lyrics_volatile_dir.clone();
                         let persisted_dir = self.lyrics_persisted_dir.clone();
                         tokio::spawn(async move {
-                            if let Err(err) = Self::prefetch_lyrics_payload_for(
+                            if let Err(err) = AppDataWorker::prefetch_lyrics_payload_for(
                                 &lyrics_session,
                                 &track_uri,
                                 &offline_index,
@@ -1125,7 +1129,9 @@ impl Runner {
             ],
         }
     }
+}
 
+impl AppDataWorker {
     async fn get_app_data(
         &self,
         session: &Session,
