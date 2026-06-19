@@ -1,4 +1,8 @@
-use std::{collections::HashMap, io::Write, time::Duration};
+use std::{
+    collections::HashMap,
+    io::Write,
+    time::{Duration, Instant},
+};
 
 use byteorder::{BigEndian, ByteOrder, WriteBytesExt};
 use bytes::Bytes;
@@ -87,12 +91,20 @@ impl AudioKeyManager {
     }
 
     pub async fn request(&self, track: SpotifyId, file: FileId) -> Result<AudioKey, Error> {
+        let profile_start = Instant::now();
+        let track_id_str = track.to_base62();
+        info!(
+            "[PlaybackProfile] audio_key:request start track={} file={}",
+            track_id_str, file
+        );
+
         let frontend_key = self.lock(|inner| {
             if let Some(callback) = inner.key_callback {
-                let track_id_str = track.to_base62();
-                trace!(
-                    "Requesting audio key from frontend for track {}",
-                    track_id_str
+                let frontend_start = Instant::now();
+                trace!("Requesting audio key from frontend for track {track_id_str}");
+                info!(
+                    "[PlaybackProfile] audio_key:frontend lookup start track={} file={}",
+                    track_id_str, file
                 );
 
                 let mut key_buffer = [0u8; 16];
@@ -107,18 +119,39 @@ impl AudioKeyManager {
                 );
 
                 if found {
-                    info!("Audio key for track {} provided by frontend", track_id_str);
+                    info!("Audio key for track {track_id_str} provided by frontend");
+                    info!(
+                        "[PlaybackProfile] audio_key:frontend lookup hit elapsed_ms={} total_ms={}",
+                        frontend_start.elapsed().as_millis(),
+                        profile_start.elapsed().as_millis()
+                    );
                     return Some(AudioKey(key_buffer));
                 }
+
+                info!(
+                    "[PlaybackProfile] audio_key:frontend lookup miss elapsed_ms={} total_ms={}",
+                    frontend_start.elapsed().as_millis(),
+                    profile_start.elapsed().as_millis()
+                );
             }
             None
         });
 
         if let Some(key) = frontend_key {
+            info!(
+                "[PlaybackProfile] audio_key:request complete source=frontend total_ms={}",
+                profile_start.elapsed().as_millis()
+            );
             return Ok(key);
         }
 
         trace!("Audio key not found in frontend; requesting from Spotify servers");
+        info!(
+            "[PlaybackProfile] audio_key:server request start track={} file={} elapsed_ms={}",
+            track_id_str,
+            file,
+            profile_start.elapsed().as_millis()
+        );
         let (tx, rx) = oneshot::channel();
 
         let seq = self.lock(move |inner| {
@@ -127,17 +160,36 @@ impl AudioKeyManager {
             seq
         });
 
+        let send_start = Instant::now();
         self.send_key_request(seq, track, file)?;
+        info!(
+            "[PlaybackProfile] audio_key:server request sent seq={} elapsed_ms={} total_ms={}",
+            seq,
+            send_start.elapsed().as_millis(),
+            profile_start.elapsed().as_millis()
+        );
 
         const KEY_RESPONSE_TIMEOUT: Duration = Duration::from_millis(1500);
+        let wait_start = Instant::now();
         match tokio::time::timeout(KEY_RESPONSE_TIMEOUT, rx).await {
             Err(_) => {
-                error!("Audio key response timeout for track {}", track.to_base62());
+                error!("Audio key response timeout for track {track_id_str}");
+                info!(
+                    "[PlaybackProfile] audio_key:server timeout wait_ms={} total_ms={}",
+                    wait_start.elapsed().as_millis(),
+                    profile_start.elapsed().as_millis()
+                );
                 Err(AudioKeyError::Timeout.into())
             }
             Ok(k) => {
                 let result: AudioKey = k.map_err(|_| AudioKeyError::Channel)??;
+                info!(
+                    "[PlaybackProfile] audio_key:server response received wait_ms={} total_ms={}",
+                    wait_start.elapsed().as_millis(),
+                    profile_start.elapsed().as_millis()
+                );
 
+                let save_start = Instant::now();
                 self.lock(|inner| {
                     if let Some(save_cb) = inner.key_save_callback {
                         let track_bytes = track.to_raw();
@@ -148,10 +200,16 @@ impl AudioKeyManager {
                         );
                     }
                 });
+                info!(
+                    "[PlaybackProfile] audio_key:save callback complete elapsed_ms={} total_ms={}",
+                    save_start.elapsed().as_millis(),
+                    profile_start.elapsed().as_millis()
+                );
 
-                trace!(
-                    "Audio key for track {} received from Spotify",
-                    track.to_base62()
+                trace!("Audio key for track {track_id_str} received from Spotify");
+                info!(
+                    "[PlaybackProfile] audio_key:request complete source=spotify total_ms={}",
+                    profile_start.elapsed().as_millis()
                 );
 
                 Ok(result)

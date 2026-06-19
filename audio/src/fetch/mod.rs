@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     sync::{Condvar, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use futures_util::{StreamExt, TryFutureExt, future::IntoStream};
@@ -264,7 +264,15 @@ impl StreamLoaderController {
     ) -> AudioFileResult {
         match self.stream_shared {
             Some(ref shared) => {
+                let profile_start = Instant::now();
                 let start = shared.read_position();
+                info!(
+                    "[PlaybackProfile] stream_loader:fetch_next_and_wait start read_position={} request_length={} wait_length={} file_size={}",
+                    start,
+                    request_length,
+                    wait_length,
+                    self.len()
+                );
 
                 let request_range = Range {
                     start,
@@ -276,9 +284,21 @@ impl StreamLoaderController {
                     start,
                     length: wait_length,
                 };
-                self.fetch_blocking(wait_range)
+                let result = self.fetch_blocking(wait_range);
+                info!(
+                    "[PlaybackProfile] stream_loader:fetch_next_and_wait complete success={} elapsed_ms={}",
+                    result.is_ok(),
+                    profile_start.elapsed().as_millis()
+                );
+                result
             }
-            None => Ok(()),
+            None => {
+                info!(
+                    "[PlaybackProfile] stream_loader:fetch_next_and_wait skipped cached/local request_length={} wait_length={}",
+                    request_length, wait_length
+                );
+                Ok(())
+            }
         }
     }
 
@@ -382,12 +402,28 @@ impl AudioFile {
         file_id: FileId,
         bytes_per_second: usize,
     ) -> Result<AudioFile, Error> {
+        let profile_start = Instant::now();
+        info!(
+            "[PlaybackProfile] audio_file:open start file_id={} bytes_per_second={}",
+            file_id, bytes_per_second
+        );
+
         if let Some(file) = session.cache().and_then(|cache| cache.file(file_id)) {
             debug!("File {file_id} already in cache");
+            info!(
+                "[PlaybackProfile] audio_file:open cache hit file_id={} elapsed_ms={}",
+                file_id,
+                profile_start.elapsed().as_millis()
+            );
             return Ok(AudioFile::Cached(file));
         }
 
         debug!("Downloading file {file_id}");
+        info!(
+            "[PlaybackProfile] audio_file:open cache miss file_id={} elapsed_ms={}",
+            file_id,
+            profile_start.elapsed().as_millis()
+        );
 
         let (complete_tx, complete_rx) = oneshot::channel();
 
@@ -409,7 +445,27 @@ impl AudioFile {
             }
         }));
 
-        Ok(AudioFile::Streaming(streaming.await?))
+        let streaming_start = Instant::now();
+        match streaming.await {
+            Ok(streaming) => {
+                info!(
+                    "[PlaybackProfile] audio_file:open streaming ready file_id={} elapsed_ms={} total_ms={}",
+                    file_id,
+                    streaming_start.elapsed().as_millis(),
+                    profile_start.elapsed().as_millis()
+                );
+                Ok(AudioFile::Streaming(streaming))
+            }
+            Err(e) => {
+                info!(
+                    "[PlaybackProfile] audio_file:open streaming failed file_id={} elapsed_ms={} total_ms={}",
+                    file_id,
+                    streaming_start.elapsed().as_millis(),
+                    profile_start.elapsed().as_millis()
+                );
+                Err(e)
+            }
+        }
     }
 
     pub fn get_stream_loader_controller(&self) -> Result<StreamLoaderController, Error> {
@@ -441,17 +497,41 @@ impl AudioFileStreaming {
         complete_tx: oneshot::Sender<NamedTempFile>,
         bytes_per_second: usize,
     ) -> Result<AudioFileStreaming, Error> {
+        let profile_start = Instant::now();
+        info!(
+            "[PlaybackProfile] audio_stream:open start file_id={} bytes_per_second={}",
+            file_id, bytes_per_second
+        );
+
+        let resolve_start = Instant::now();
         let cdn_url = CdnUrl::new(file_id).resolve_audio(&session).await?;
+        info!(
+            "[PlaybackProfile] audio_stream:open CDN resolved file_id={} elapsed_ms={} total_ms={}",
+            file_id,
+            resolve_start.elapsed().as_millis(),
+            profile_start.elapsed().as_millis()
+        );
 
         let minimum_download_size = AudioFetchParams::get().minimum_download_size;
 
         let mut response_streamer_url = None;
         let urls = cdn_url.try_get_urls()?;
-        for url in &urls {
+        info!(
+            "[PlaybackProfile] audio_stream:open CDN URL count file_id={} urls={} minimum_download_size={}",
+            file_id,
+            urls.len(),
+            minimum_download_size
+        );
+        for (url_index, url) in urls.iter().enumerate() {
             // When the audio file is really small, this `download_size` may turn out to be
             // larger than the audio file we're going to stream later on. This is OK; requesting
             // `Content-Range` > `Content-Length` will return the complete file with status code
             // 206 Partial Content.
+            let first_response_start = Instant::now();
+            info!(
+                "[PlaybackProfile] audio_stream:open initial CDN request start file_id={} url_index={} length={}",
+                file_id, url_index, minimum_download_size
+            );
             let mut streamer =
                 session
                     .spclient()
@@ -468,10 +548,26 @@ impl AudioFileStreaming {
 
             match streamer_result {
                 Ok(r) => {
+                    info!(
+                        "[PlaybackProfile] audio_stream:open initial CDN response success file_id={} url_index={} elapsed_ms={} total_ms={}",
+                        file_id,
+                        url_index,
+                        first_response_start.elapsed().as_millis(),
+                        profile_start.elapsed().as_millis()
+                    );
                     response_streamer_url = Some((r, streamer, url));
                     break;
                 }
-                Err(e) => warn!("Fetching {url} failed with error {e:?}, trying next"),
+                Err(e) => {
+                    info!(
+                        "[PlaybackProfile] audio_stream:open initial CDN response failed file_id={} url_index={} elapsed_ms={} total_ms={}",
+                        file_id,
+                        url_index,
+                        first_response_start.elapsed().as_millis(),
+                        profile_start.elapsed().as_millis()
+                    );
+                    warn!("Fetching {url} failed with error {e:?}, trying next")
+                }
             }
         }
 
@@ -499,6 +595,13 @@ impl AudioFileStreaming {
         let slash_index = str_value.find('/').unwrap_or_default();
         let upper_bound: usize = str_value[hyphen_index + 1..slash_index].parse()?;
         let file_size = str_value[slash_index + 1..].parse()?;
+        info!(
+            "[PlaybackProfile] audio_stream:open headers parsed file_id={} initial_length={} file_size={} total_ms={}",
+            file_id,
+            upper_bound + 1,
+            file_size,
+            profile_start.elapsed().as_millis()
+        );
 
         let initial_request = StreamingRequest {
             streamer,
@@ -539,6 +642,11 @@ impl AudioFileStreaming {
             stream_loader_command_rx,
             complete_tx,
         ));
+        info!(
+            "[PlaybackProfile] audio_stream:open fetch task spawned file_id={} total_ms={}",
+            file_id,
+            profile_start.elapsed().as_millis()
+        );
 
         Ok(AudioFileStreaming {
             read_file,
@@ -593,7 +701,10 @@ impl Read for AudioFileStreaming {
         }
 
         let download_timeout = AudioFetchParams::get().download_timeout;
+        let wait_start = Instant::now();
+        let mut waited_for_data = false;
         while !download_status.downloaded.contains(offset) {
+            waited_for_data = true;
             let (new_download_status, wait_result) = self
                 .shared
                 .cond
@@ -611,6 +722,16 @@ impl Read for AudioFileStreaming {
         let available_length = download_status
             .downloaded
             .contained_length_from_value(offset);
+        if waited_for_data || offset == 0 {
+            info!(
+                "[PlaybackProfile] audio_stream:read data ready offset={} requested_length={} available_length={} waited={} elapsed_ms={}",
+                offset,
+                length,
+                available_length,
+                waited_for_data,
+                wait_start.elapsed().as_millis()
+            );
+        }
 
         drop(download_status);
 

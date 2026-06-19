@@ -548,15 +548,33 @@ impl Runner {
                             }
                         }
                         LibrespotCommand::Load { context_uri, start_from_uri, play } => {
+                            let profile_start = Instant::now();
+                            log::info!(
+                                "[PlaybackProfile] runner:load command received context={} start={} play={}",
+                                context_uri,
+                                start_from_uri.as_deref().unwrap_or("(null)"),
+                                play
+                            );
+
                             if let Ok(_ctx_uri) = SpotifyUri::from_uri(&context_uri) {
                                 player.stop();
                                 self.state.position_ms.store(0, Ordering::Release);
                                 self.state
                                     .sync_write_pos
                                     .store(librespot_playback::audio_backend::get_write_pos(), Ordering::Release);
+                                log::info!(
+                                    "[PlaybackProfile] runner:load player stopped/state reset elapsed_ms={}",
+                                    profile_start.elapsed().as_millis()
+                                );
 
                                 if let Some(ref s) = spirc {
+                                    let activate_start = Instant::now();
                                     let _ = s.activate();
+                                    log::info!(
+                                        "[PlaybackProfile] runner:load spirc activate queued elapsed_ms={} total_ms={}",
+                                        activate_start.elapsed().as_millis(),
+                                        profile_start.elapsed().as_millis()
+                                    );
 
                                     let context_options = LoadContextOptions::Options(Options {
                                         shuffle: self.state.shuffle.load(Ordering::Acquire),
@@ -574,12 +592,30 @@ impl Runner {
                                     };
 
                                     let request = LoadRequest::from_context_uri(context_uri, options);
+                                    let load_start = Instant::now();
                                     if let Err(e) = s.load(request) {
                                         log::error!("Spirc load failed: {:?}", e);
+                                        log::info!(
+                                            "[PlaybackProfile] runner:load spirc load queue failed elapsed_ms={} total_ms={}",
+                                            load_start.elapsed().as_millis(),
+                                            profile_start.elapsed().as_millis()
+                                        );
+                                    } else {
+                                        log::info!(
+                                            "[PlaybackProfile] runner:load spirc load queued elapsed_ms={} total_ms={}",
+                                            load_start.elapsed().as_millis(),
+                                            profile_start.elapsed().as_millis()
+                                        );
                                     }
                                 } else {
                                     let track_to_load = start_from_uri.unwrap_or(context_uri);
                                     if let Ok(t_uri) = SpotifyUri::from_uri(&track_to_load) {
+                                        log::info!(
+                                            "[PlaybackProfile] runner:load direct player load track={} play={} elapsed_ms={}",
+                                            track_to_load,
+                                            play,
+                                            profile_start.elapsed().as_millis()
+                                        );
                                         let entry = self
                                             .offline_index
                                             .lock()

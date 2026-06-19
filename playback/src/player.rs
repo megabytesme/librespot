@@ -770,6 +770,7 @@ enum PlayerState {
         duration_ms: u32,
         stream_position_ms: u32,
         reported_nominal_start_time: Option<Instant>,
+        reported_first_sink_write: bool,
         suggested_to_preload_next_track: bool,
         is_explicit: bool,
     },
@@ -893,6 +894,7 @@ impl PlayerState {
                     stream_position_ms,
                     reported_nominal_start_time: Instant::now()
                         .checked_sub(Duration::from_millis(stream_position_ms as u64)),
+                    reported_first_sink_write: false,
                     suggested_to_preload_next_track,
                     is_explicit,
                 };
@@ -954,26 +956,63 @@ struct PlayerTrackLoader {
 
 impl PlayerTrackLoader {
     async fn find_available_alternative(&self, audio_item: AudioItem) -> Option<AudioItem> {
+        let profile_start = Instant::now();
+        let item_uri = audio_item.uri.clone();
+        info!(
+            "[PlaybackProfile] player:find_available_alternative start uri={} files={} has_alternatives={}",
+            item_uri,
+            audio_item.files.len(),
+            audio_item.alternatives.is_some()
+        );
+
         if let Err(e) = audio_item.availability {
             error!("Track is unavailable: {e}");
+            info!(
+                "[PlaybackProfile] player:find_available_alternative unavailable uri={} elapsed_ms={}",
+                item_uri,
+                profile_start.elapsed().as_millis()
+            );
             None
         } else if !audio_item.files.is_empty() {
+            info!(
+                "[PlaybackProfile] player:find_available_alternative primary available uri={} elapsed_ms={}",
+                item_uri,
+                profile_start.elapsed().as_millis()
+            );
             Some(audio_item)
         } else if let Some(alternatives) = audio_item.alternatives {
             let Tracks(alternatives_vec) = alternatives; // required to make `into_iter` able to move
+            info!(
+                "[PlaybackProfile] player:find_available_alternative checking alternatives uri={} count={} elapsed_ms={}",
+                item_uri,
+                alternatives_vec.len(),
+                profile_start.elapsed().as_millis()
+            );
 
             let alternatives: FuturesUnordered<_> = alternatives_vec
                 .into_iter()
                 .map(|alt_id| AudioItem::get_file(&self.session, alt_id))
                 .collect();
 
-            alternatives
+            let result = alternatives
                 .filter_map(|x| future::ready(x.ok()))
                 .filter(|x| future::ready(x.availability.is_ok()))
                 .next()
-                .await
+                .await;
+            info!(
+                "[PlaybackProfile] player:find_available_alternative alternatives complete uri={} found={} elapsed_ms={}",
+                item_uri,
+                result.is_some(),
+                profile_start.elapsed().as_millis()
+            );
+            result
         } else {
             error!("Track should be available, but no alternatives found.");
+            info!(
+                "[PlaybackProfile] player:find_available_alternative no alternatives uri={} elapsed_ms={}",
+                item_uri,
+                profile_start.elapsed().as_millis()
+            );
             None
         }
     }
@@ -1097,24 +1136,62 @@ impl PlayerTrackLoader {
         track_uri: SpotifyUri,
         position_ms: u32,
     ) -> Option<PlayerLoadedTrackData> {
+        let profile_start = Instant::now();
+        info!(
+            "[PlaybackProfile] player:load_remote_track start uri={} position_ms={}",
+            track_uri, position_ms
+        );
+
         let track_id: SpotifyId = match (&track_uri).try_into() {
             Ok(id) => id,
             Err(_) => {
                 warn!("<{track_uri}> could not be converted to a base62 ID");
+                info!(
+                    "[PlaybackProfile] player:load_remote_track invalid uri elapsed_ms={}",
+                    profile_start.elapsed().as_millis()
+                );
                 return None;
             }
         };
 
+        let metadata_start = Instant::now();
         let audio_item = match AudioItem::get_file(&self.session, track_uri).await {
-            Ok(audio) => match self.find_available_alternative(audio).await {
-                Some(audio) => audio,
-                None => {
-                    warn!("spotify:track:<{}> is not available", track_id.to_base62());
-                    return None;
+            Ok(audio) => {
+                info!(
+                    "[PlaybackProfile] player:load_remote_track AudioItem::get_file complete uri={} elapsed_ms={} total_ms={}",
+                    audio.uri,
+                    metadata_start.elapsed().as_millis(),
+                    profile_start.elapsed().as_millis()
+                );
+
+                let alternative_start = Instant::now();
+                match self.find_available_alternative(audio).await {
+                    Some(audio) => {
+                        info!(
+                            "[PlaybackProfile] player:load_remote_track availability resolved uri={} elapsed_ms={} total_ms={}",
+                            audio.uri,
+                            alternative_start.elapsed().as_millis(),
+                            profile_start.elapsed().as_millis()
+                        );
+                        audio
+                    }
+                    None => {
+                        warn!("spotify:track:<{}> is not available", track_id.to_base62());
+                        info!(
+                            "[PlaybackProfile] player:load_remote_track unavailable elapsed_ms={}",
+                            profile_start.elapsed().as_millis()
+                        );
+                        return None;
+                    }
                 }
-            },
+            }
             Err(e) => {
                 error!("Unable to load audio item: {e:?}");
+                info!(
+                    "[PlaybackProfile] player:load_remote_track AudioItem::get_file failed elapsed_ms={} total_ms={}",
+                    metadata_start.elapsed().as_millis(),
+                    profile_start.elapsed().as_millis()
+                );
                 return None;
             }
         };
@@ -1172,24 +1249,54 @@ impl PlayerTrackLoader {
                 }
             };
 
-        let encrypted_file =
-            match AudioFile::open(&self.session, file_id, self.stream_data_rate(format)?).await {
-                Ok(encrypted_file) => encrypted_file,
-                Err(e) => {
-                    error!("Unable to load encrypted file: {e:?}");
-                    return None;
-                }
-            };
-
-        self.load_open_audio_file(
-            track_id,
-            encrypted_file,
-            file_id,
+        let bytes_per_second = self.stream_data_rate(format)?;
+        info!(
+            "[PlaybackProfile] player:load_remote_track selected file uri={} format={:?} file_id={} bytes_per_second={} total_ms={}",
+            audio_item.uri,
             format,
-            audio_item,
-            position_ms,
-        )
-        .await
+            file_id,
+            bytes_per_second,
+            profile_start.elapsed().as_millis()
+        );
+
+        let open_start = Instant::now();
+        let encrypted_file = match AudioFile::open(&self.session, file_id, bytes_per_second).await {
+            Ok(encrypted_file) => encrypted_file,
+            Err(e) => {
+                error!("Unable to load encrypted file: {e:?}");
+                info!(
+                    "[PlaybackProfile] player:load_remote_track AudioFile::open failed elapsed_ms={} total_ms={}",
+                    open_start.elapsed().as_millis(),
+                    profile_start.elapsed().as_millis()
+                );
+                return None;
+            }
+        };
+        info!(
+            "[PlaybackProfile] player:load_remote_track AudioFile::open complete cached={} elapsed_ms={} total_ms={}",
+            encrypted_file.is_cached(),
+            open_start.elapsed().as_millis(),
+            profile_start.elapsed().as_millis()
+        );
+
+        let decode_start = Instant::now();
+        let result = self
+            .load_open_audio_file(
+                track_id,
+                encrypted_file,
+                file_id,
+                format,
+                audio_item,
+                position_ms,
+            )
+            .await;
+        info!(
+            "[PlaybackProfile] player:load_remote_track load_open_audio_file complete success={} elapsed_ms={} total_ms={}",
+            result.is_some(),
+            decode_start.elapsed().as_millis(),
+            profile_start.elapsed().as_millis()
+        );
+        result
     }
 
     async fn load_open_audio_file(
@@ -1201,36 +1308,83 @@ impl PlayerTrackLoader {
         audio_item: AudioItem,
         position_ms: u32,
     ) -> Option<PlayerLoadedTrackData> {
+        let profile_start = Instant::now();
         let bytes_per_second = self.stream_data_rate(format)?;
         let mut encrypted_file = encrypted_file;
+        let track_id_base62 = track_id.to_base62();
+        let mut attempt = 0u32;
+        info!(
+            "[PlaybackProfile] player:load_open_audio_file start track={} file_id={} format={:?} position_ms={} bytes_per_second={}",
+            track_id_base62, file_id, format, position_ms, bytes_per_second
+        );
 
         loop {
+            attempt += 1;
+            let attempt_start = Instant::now();
             let is_cached = encrypted_file.is_cached();
             let stream_loader_controller = encrypted_file.get_stream_loader_controller().ok()?;
+            info!(
+                "[PlaybackProfile] player:load_open_audio_file controller ready track={} attempt={} cached={} file_size={} elapsed_ms={} total_ms={}",
+                track_id_base62,
+                attempt,
+                is_cached,
+                stream_loader_controller.len(),
+                attempt_start.elapsed().as_millis(),
+                profile_start.elapsed().as_millis()
+            );
 
             // Not all audio files are encrypted. If we can't get a key, try loading the track
             // without decryption. If the file was encrypted after all, the decoder will fail
             // parsing and bail out, so we should be safe from outputting ear-piercing noise.
+            let key_start = Instant::now();
             let key = match self.session.audio_key().request(track_id, file_id).await {
-                Ok(key) => Some(key),
+                Ok(key) => {
+                    info!(
+                        "[PlaybackProfile] player:load_open_audio_file audio key complete track={} elapsed_ms={} total_ms={}",
+                        track_id_base62,
+                        key_start.elapsed().as_millis(),
+                        profile_start.elapsed().as_millis()
+                    );
+                    Some(key)
+                }
                 Err(e) => {
                     warn!("Unable to load key, continuing without decryption: {e}");
+                    info!(
+                        "[PlaybackProfile] player:load_open_audio_file audio key failed track={} elapsed_ms={} total_ms={}",
+                        track_id_base62,
+                        key_start.elapsed().as_millis(),
+                        profile_start.elapsed().as_millis()
+                    );
                     None
                 }
             };
 
             let mut decrypted_file = AudioDecrypt::new(key, encrypted_file);
+            info!(
+                "[PlaybackProfile] player:load_open_audio_file decrypt wrapper ready track={} total_ms={}",
+                track_id_base62,
+                profile_start.elapsed().as_millis()
+            );
 
             let is_ogg_vorbis = AudioFiles::is_ogg_vorbis(format);
             let (offset, mut normalisation_data) = if is_ogg_vorbis {
                 // Spotify stores normalisation data in a custom Ogg packet instead of Vorbis comments.
+                let normalisation_start = Instant::now();
                 let normalisation_data =
                     NormalisationData::parse_from_ogg(&mut decrypted_file).ok();
+                info!(
+                    "[PlaybackProfile] player:load_open_audio_file Ogg normalisation parsed track={} found={} elapsed_ms={} total_ms={}",
+                    track_id_base62,
+                    normalisation_data.is_some(),
+                    normalisation_start.elapsed().as_millis(),
+                    profile_start.elapsed().as_millis()
+                );
                 (SPOTIFY_OGG_HEADER_END, normalisation_data)
             } else {
                 (0, None)
             };
 
+            let subfile_start = Instant::now();
             let audio_file = match Subfile::new(
                 decrypted_file,
                 offset,
@@ -1239,9 +1393,22 @@ impl PlayerTrackLoader {
                 Ok(audio_file) => audio_file,
                 Err(e) => {
                     error!("PlayerTrackLoader::load_track error opening subfile: {e}");
+                    info!(
+                        "[PlaybackProfile] player:load_open_audio_file subfile failed track={} elapsed_ms={} total_ms={}",
+                        track_id_base62,
+                        subfile_start.elapsed().as_millis(),
+                        profile_start.elapsed().as_millis()
+                    );
                     return None;
                 }
             };
+            info!(
+                "[PlaybackProfile] player:load_open_audio_file subfile ready track={} offset={} elapsed_ms={} total_ms={}",
+                track_id_base62,
+                offset,
+                subfile_start.elapsed().as_millis(),
+                profile_start.elapsed().as_millis()
+            );
 
             let mut symphonia_decoder = |audio_file, format| {
                 SymphoniaDecoder::new(audio_file, format).map(|mut decoder| {
@@ -1259,6 +1426,7 @@ impl PlayerTrackLoader {
                 hint.mime_type(mime_type);
             }
 
+            let decoder_start = Instant::now();
             #[cfg(feature = "passthrough-decoder")]
             let decoder_type = if self.config.passthrough {
                 PassthroughDecoder::new(audio_file, format).map(|x| Box::new(x) as Decoder)
@@ -1275,9 +1443,23 @@ impl PlayerTrackLoader {
             });
 
             let mut decoder = match decoder_type {
-                Ok(decoder) => decoder,
+                Ok(decoder) => {
+                    info!(
+                        "[PlaybackProfile] player:load_open_audio_file decoder ready track={} elapsed_ms={} total_ms={}",
+                        track_id_base62,
+                        decoder_start.elapsed().as_millis(),
+                        profile_start.elapsed().as_millis()
+                    );
+                    decoder
+                }
                 Err(e) if is_cached => {
                     warn!("Unable to read cached audio file: {e}. Trying to download it.");
+                    info!(
+                        "[PlaybackProfile] player:load_open_audio_file cached decoder failed track={} elapsed_ms={} total_ms={}",
+                        track_id_base62,
+                        decoder_start.elapsed().as_millis(),
+                        profile_start.elapsed().as_millis()
+                    );
 
                     match self.session.cache() {
                         Some(cache) => {
@@ -1292,18 +1474,39 @@ impl PlayerTrackLoader {
                         }
                     }
 
-                    encrypted_file =
-                        match AudioFile::open(&self.session, file_id, bytes_per_second).await {
-                            Ok(file) => file,
-                            Err(err) => {
-                                error!("Unable to reload encrypted file: {err:?}");
-                                return None;
-                            }
-                        };
+                    let reopen_start = Instant::now();
+                    encrypted_file = match AudioFile::open(&self.session, file_id, bytes_per_second)
+                        .await
+                    {
+                        Ok(file) => file,
+                        Err(err) => {
+                            error!("Unable to reload encrypted file: {err:?}");
+                            info!(
+                                "[PlaybackProfile] player:load_open_audio_file reload failed track={} elapsed_ms={} total_ms={}",
+                                track_id_base62,
+                                reopen_start.elapsed().as_millis(),
+                                profile_start.elapsed().as_millis()
+                            );
+                            return None;
+                        }
+                    };
+                    info!(
+                        "[PlaybackProfile] player:load_open_audio_file reload complete track={} cached={} elapsed_ms={} total_ms={}",
+                        track_id_base62,
+                        encrypted_file.is_cached(),
+                        reopen_start.elapsed().as_millis(),
+                        profile_start.elapsed().as_millis()
+                    );
                     continue;
                 }
                 Err(e) => {
                     error!("Unable to read audio file: {e}");
+                    info!(
+                        "[PlaybackProfile] player:load_open_audio_file decoder failed track={} elapsed_ms={} total_ms={}",
+                        track_id_base62,
+                        decoder_start.elapsed().as_millis(),
+                        profile_start.elapsed().as_millis()
+                    );
                     return None;
                 }
             };
@@ -1325,22 +1528,49 @@ impl PlayerTrackLoader {
             // the cursor may have been moved by parsing normalisation data. This may not
             // matter for playback (but won't hurt either), but may be useful for the
             // passthrough decoder.
+            let seek_start = Instant::now();
             let stream_position_ms = match decoder.seek(position_ms) {
                 Ok(new_position_ms) => new_position_ms,
                 Err(e) => {
                     error!(
                         "PlayerTrackLoader::load_track error seeking to starting position {position_ms}: {e}"
                     );
+                    info!(
+                        "[PlaybackProfile] player:load_open_audio_file decoder seek failed track={} elapsed_ms={} total_ms={}",
+                        track_id_base62,
+                        seek_start.elapsed().as_millis(),
+                        profile_start.elapsed().as_millis()
+                    );
                     return None;
                 }
             };
+            info!(
+                "[PlaybackProfile] player:load_open_audio_file decoder seek complete track={} requested_ms={} actual_ms={} elapsed_ms={} total_ms={}",
+                track_id_base62,
+                position_ms,
+                stream_position_ms,
+                seek_start.elapsed().as_millis(),
+                profile_start.elapsed().as_millis()
+            );
 
             // Ensure streaming mode now that we are ready to play from the requested position.
             stream_loader_controller.set_stream_mode();
+            info!(
+                "[PlaybackProfile] player:load_open_audio_file stream mode set track={} total_ms={}",
+                track_id_base62,
+                profile_start.elapsed().as_millis()
+            );
 
             let is_explicit = audio_item.is_explicit;
 
             info!("<{}> ({} ms) loaded", audio_item.name, duration_ms);
+            info!(
+                "[PlaybackProfile] player:load_open_audio_file loaded track={} name={} duration_ms={} total_ms={}",
+                track_id_base62,
+                audio_item.name,
+                duration_ms,
+                profile_start.elapsed().as_millis()
+            );
 
             return Some(PlayerLoadedTrackData {
                 decoder,
@@ -1500,6 +1730,10 @@ impl Future for PlayerInternal {
                 if !loader.as_mut().is_terminated() {
                     match loader.as_mut().poll(cx) {
                         Poll::Ready(Ok(loaded_track)) => {
+                            info!(
+                                "[PlaybackProfile] player:loader ready track={} play_request_id={} start_playback={}",
+                                track_id, play_request_id, start_playback
+                            );
                             self.start_playback(
                                 track_id,
                                 play_request_id,
@@ -1734,13 +1968,28 @@ impl PlayerInternal {
     fn ensure_sink_running(&mut self) {
         if self.sink_status != SinkStatus::Running {
             trace!("== Starting sink ==");
+            let profile_start = Instant::now();
+            info!(
+                "[PlaybackProfile] player:sink start requested previous_status={:?}",
+                self.sink_status
+            );
             if let Some(callback) = &mut self.sink_event_callback {
                 callback(SinkStatus::Running);
             }
             match self.sink.start() {
-                Ok(()) => self.sink_status = SinkStatus::Running,
+                Ok(()) => {
+                    self.sink_status = SinkStatus::Running;
+                    info!(
+                        "[PlaybackProfile] player:sink start complete elapsed_ms={}",
+                        profile_start.elapsed().as_millis()
+                    );
+                }
                 Err(e) => {
                     error!("{e}");
+                    info!(
+                        "[PlaybackProfile] player:sink start failed elapsed_ms={}",
+                        profile_start.elapsed().as_millis()
+                    );
                     self.handle_pause();
                 }
             }
@@ -1978,9 +2227,45 @@ impl PlayerInternal {
                         }
                     }
 
-                    if let Err(e) = self.sink.write(packet, &mut self.converter) {
-                        error!("{e}");
-                        self.handle_pause();
+                    let first_sink_write = match self.state {
+                        PlayerState::Playing {
+                            ref track_id,
+                            stream_position_ms,
+                            reported_first_sink_write,
+                            ..
+                        } if !reported_first_sink_write => {
+                            Some((track_id.clone(), stream_position_ms))
+                        }
+                        _ => None,
+                    };
+
+                    let sink_write_start = Instant::now();
+                    match self.sink.write(packet, &mut self.converter) {
+                        Ok(()) => {
+                            if let Some((track_id, stream_position_ms)) = first_sink_write {
+                                if let PlayerState::Playing {
+                                    ref mut reported_first_sink_write,
+                                    ..
+                                } = self.state
+                                {
+                                    *reported_first_sink_write = true;
+                                }
+                                info!(
+                                    "[PlaybackProfile] player:first sink write track={} stream_position_ms={} elapsed_ms={}",
+                                    track_id,
+                                    stream_position_ms,
+                                    sink_write_start.elapsed().as_millis()
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            error!("{e}");
+                            info!(
+                                "[PlaybackProfile] player:sink write failed elapsed_ms={}",
+                                sink_write_start.elapsed().as_millis()
+                            );
+                            self.handle_pause();
+                        }
                     }
                 }
             }
@@ -2012,9 +2297,22 @@ impl PlayerInternal {
         loaded_track: PlayerLoadedTrackData,
         start_playback: bool,
     ) {
+        let profile_start = Instant::now();
+        info!(
+            "[PlaybackProfile] player:start_playback start track={} play_request_id={} start_playback={} stream_position_ms={} duration_ms={}",
+            track_id,
+            play_request_id,
+            start_playback,
+            loaded_track.stream_position_ms,
+            loaded_track.duration_ms
+        );
         let audio_item = Box::new(loaded_track.audio_item.clone());
 
         self.send_event(PlayerEvent::TrackChanged { audio_item });
+        info!(
+            "[PlaybackProfile] player:start_playback TrackChanged emitted elapsed_ms={}",
+            profile_start.elapsed().as_millis()
+        );
 
         let position_ms = loaded_track.stream_position_ms;
 
@@ -2036,6 +2334,10 @@ impl PlayerInternal {
                 play_request_id,
                 position_ms,
             });
+            info!(
+                "[PlaybackProfile] player:start_playback Playing emitted elapsed_ms={}",
+                profile_start.elapsed().as_millis()
+            );
 
             self.state = PlayerState::Playing {
                 track_id,
@@ -2050,9 +2352,14 @@ impl PlayerInternal {
                 stream_position_ms: loaded_track.stream_position_ms,
                 reported_nominal_start_time: Instant::now()
                     .checked_sub(Duration::from_millis(position_ms as u64)),
+                reported_first_sink_write: false,
                 suggested_to_preload_next_track: false,
                 is_explicit: loaded_track.is_explicit,
             };
+            info!(
+                "[PlaybackProfile] player:start_playback state=Playing total_ms={}",
+                profile_start.elapsed().as_millis()
+            );
         } else {
             self.ensure_sink_stopped(false);
 
@@ -2076,6 +2383,10 @@ impl PlayerInternal {
                 play_request_id,
                 position_ms,
             });
+            info!(
+                "[PlaybackProfile] player:start_playback state=Paused total_ms={}",
+                profile_start.elapsed().as_millis()
+            );
         }
     }
 
@@ -2086,8 +2397,13 @@ impl PlayerInternal {
         play: bool,
         position_ms: u32,
     ) -> PlayerResult {
+        let profile_start = Instant::now();
         let play_request_id =
             play_request_id_option.unwrap_or(self.play_request_id_generator.get());
+        info!(
+            "[PlaybackProfile] player:handle_command_load start track={} play_request_id={} play={} position_ms={}",
+            track_id, play_request_id, play, position_ms
+        );
 
         self.send_event(PlayerEvent::PlayRequestIdChanged { play_request_id });
 
@@ -2125,7 +2441,13 @@ impl PlayerInternal {
 
                 if position_ms != loaded_track.stream_position_ms {
                     // This may be blocking.
+                    let seek_start = Instant::now();
                     loaded_track.stream_position_ms = loaded_track.decoder.seek(position_ms)?;
+                    info!(
+                        "[PlaybackProfile] player:handle_command_load repeat seek complete elapsed_ms={} total_ms={}",
+                        seek_start.elapsed().as_millis(),
+                        profile_start.elapsed().as_millis()
+                    );
                 }
                 self.preload = PlayerPreload::None;
                 self.start_playback(track_id, play_request_id, loaded_track, play);
@@ -2135,6 +2457,10 @@ impl PlayerInternal {
                         self.state
                     )));
                 }
+                info!(
+                    "[PlaybackProfile] player:handle_command_load reused end-of-track total_ms={}",
+                    profile_start.elapsed().as_millis()
+                );
                 return Ok(());
             }
         }
@@ -2157,7 +2483,13 @@ impl PlayerInternal {
                 // we can use the current decoder. Ensure it's at the correct position.
                 if position_ms != *stream_position_ms {
                     // This may be blocking.
+                    let seek_start = Instant::now();
                     *stream_position_ms = decoder.seek(position_ms)?;
+                    info!(
+                        "[PlaybackProfile] player:handle_command_load current decoder seek complete elapsed_ms={} total_ms={}",
+                        seek_start.elapsed().as_millis(),
+                        profile_start.elapsed().as_millis()
+                    );
                 }
 
                 // Move the info from the current state into a PlayerLoadedTrackData so we can use
@@ -2208,6 +2540,10 @@ impl PlayerInternal {
                         )));
                     }
 
+                    info!(
+                        "[PlaybackProfile] player:handle_command_load reused current decoder total_ms={}",
+                        profile_start.elapsed().as_millis()
+                    );
                     return Ok(());
                 } else {
                     return Err(Error::internal(format!(
@@ -2233,9 +2569,19 @@ impl PlayerInternal {
                 {
                     if position_ms != loaded_track.stream_position_ms {
                         // This may be blocking
+                        let seek_start = Instant::now();
                         loaded_track.stream_position_ms = loaded_track.decoder.seek(position_ms)?;
+                        info!(
+                            "[PlaybackProfile] player:handle_command_load ready preload seek complete elapsed_ms={} total_ms={}",
+                            seek_start.elapsed().as_millis(),
+                            profile_start.elapsed().as_millis()
+                        );
                     }
                     self.start_playback(track_id, play_request_id, *loaded_track, play);
+                    info!(
+                        "[PlaybackProfile] player:handle_command_load used ready preload total_ms={}",
+                        profile_start.elapsed().as_millis()
+                    );
                     return Ok(());
                 } else {
                     return Err(Error::internal(format!(
@@ -2251,8 +2597,13 @@ impl PlayerInternal {
             play_request_id,
             position_ms,
         });
+        info!(
+            "[PlaybackProfile] player:handle_command_load Loading emitted total_ms={}",
+            profile_start.elapsed().as_millis()
+        );
 
         // Try to extract a pending loader from the preloading mechanism
+        let mut reused_loading_preload = false;
         let loader = if let PlayerPreload::Loading {
             track_id: loaded_track_id,
             ..
@@ -2262,6 +2613,7 @@ impl PlayerInternal {
                 let mut preload = PlayerPreload::None;
                 std::mem::swap(&mut preload, &mut self.preload);
                 if let PlayerPreload::Loading { loader, .. } = preload {
+                    reused_loading_preload = true;
                     Some(loader)
                 } else {
                     None
@@ -2278,6 +2630,11 @@ impl PlayerInternal {
         // If we don't have a loader yet, create one from scratch.
         let loader =
             loader.unwrap_or_else(|| Box::pin(self.load_track(track_id.clone(), position_ms)));
+        info!(
+            "[PlaybackProfile] player:handle_command_load loader prepared reused_preload={} total_ms={}",
+            reused_loading_preload,
+            profile_start.elapsed().as_millis()
+        );
 
         // Set ourselves to a loading state.
         self.state = PlayerState::Loading {
@@ -2287,6 +2644,10 @@ impl PlayerInternal {
             loader,
         };
 
+        info!(
+            "[PlaybackProfile] player:handle_command_load state=Loading total_ms={}",
+            profile_start.elapsed().as_millis()
+        );
         Ok(())
     }
 
@@ -2659,6 +3020,7 @@ impl PlayerInternal {
             ..
         } = self.state
         {
+            let profile_start = Instant::now();
             let read_ahead_during_playback = AudioFetchParams::get().read_ahead_during_playback;
             // Request our read ahead range
             let request_data_length =
@@ -2668,7 +3030,18 @@ impl PlayerInternal {
             let wait_for_data_length =
                 (read_ahead_during_playback.as_secs_f32() * bytes_per_second as f32) as usize;
 
-            stream_loader_controller.fetch_next_and_wait(request_data_length, wait_for_data_length)
+            info!(
+                "[PlaybackProfile] player:preload_data_before_playback start request_length={} wait_length={} bytes_per_second={}",
+                request_data_length, wait_for_data_length, bytes_per_second
+            );
+            let result = stream_loader_controller
+                .fetch_next_and_wait(request_data_length, wait_for_data_length);
+            info!(
+                "[PlaybackProfile] player:preload_data_before_playback complete success={} elapsed_ms={}",
+                result.is_ok(),
+                profile_start.elapsed().as_millis()
+            );
+            result
         } else {
             Ok(())
         }

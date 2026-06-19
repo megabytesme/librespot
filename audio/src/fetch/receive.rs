@@ -40,6 +40,13 @@ async fn receive_data(
     file_data_tx: mpsc::UnboundedSender<ReceivedData>,
     mut request: StreamingRequest,
 ) -> AudioFileResult {
+    let profile_start = Instant::now();
+    info!(
+        "[PlaybackProfile] audio_fetch:receive_data start offset={} length={} has_initial_response={}",
+        request.offset,
+        request.length,
+        request.initial_response.is_some()
+    );
     let mut offset = request.offset;
     let mut actual_length = 0;
 
@@ -55,11 +62,23 @@ async fn receive_data(
                 // the request was already made outside of this function
                 measure_ping_time = false;
                 measure_throughput = false;
+                info!(
+                    "[PlaybackProfile] audio_fetch:receive_data using initial response offset={} elapsed_ms={}",
+                    request.offset,
+                    profile_start.elapsed().as_millis()
+                );
 
                 data
             }
             None => match request.streamer.next().await {
-                Some(Ok(response)) => response,
+                Some(Ok(response)) => {
+                    info!(
+                        "[PlaybackProfile] audio_fetch:receive_data response received offset={} elapsed_ms={}",
+                        request.offset,
+                        profile_start.elapsed().as_millis()
+                    );
+                    response
+                }
                 Some(Err(e)) => break Err(e.into()),
                 None => {
                     if actual_length != request.length {
@@ -109,6 +128,14 @@ async fn receive_data(
         };
 
         let data_size = data.len();
+        info!(
+            "[PlaybackProfile] audio_fetch:receive_data body collected offset={} chunk_offset={} bytes={} total_received={} elapsed_ms={}",
+            request.offset,
+            offset,
+            data_size,
+            actual_length + data_size,
+            profile_start.elapsed().as_millis()
+        );
         file_data_tx.send(ReceivedData::Data(PartialFileData { offset, data }))?;
 
         actual_length += data_size;
@@ -145,9 +172,23 @@ async fn receive_data(
             "Streamer error requesting range {} +{}: {:?}",
             request.offset, request.length, e
         );
+        info!(
+            "[PlaybackProfile] audio_fetch:receive_data failed offset={} length={} bytes_received={} elapsed_ms={}",
+            request.offset,
+            request.length,
+            actual_length,
+            profile_start.elapsed().as_millis()
+        );
         return Err(e);
     }
 
+    info!(
+        "[PlaybackProfile] audio_fetch:receive_data complete offset={} length={} bytes_received={} elapsed_ms={}",
+        request.offset,
+        request.length,
+        actual_length,
+        profile_start.elapsed().as_millis()
+    );
     Ok(())
 }
 
@@ -176,6 +217,8 @@ impl AudioFileFetch {
     }
 
     fn download_range(&mut self, offset: usize, mut length: usize) -> AudioFileResult {
+        let profile_start = Instant::now();
+        let requested_length = length;
         if length < self.params.minimum_download_size {
             length = self.params.minimum_download_size;
         }
@@ -209,6 +252,14 @@ impl AudioFileFetch {
         // TODO : refresh cdn_url when the token expired
 
         for range in ranges_to_request.iter() {
+            info!(
+                "[PlaybackProfile] audio_fetch:download_range scheduling offset={} length={} requested_length={} streaming={} file_size={}",
+                range.start,
+                range.length,
+                requested_length,
+                self.shared.is_download_streaming(),
+                self.shared.file_size
+            );
             let streamer = self.session.spclient().stream_from_cdn(
                 &self.shared.cdn_url,
                 range.start,
@@ -231,6 +282,14 @@ impl AudioFileFetch {
             ));
         }
 
+        info!(
+            "[PlaybackProfile] audio_fetch:download_range complete offset={} requested_length={} effective_length={} new_ranges={} elapsed_ms={}",
+            offset,
+            requested_length,
+            length,
+            ranges_to_request.len(),
+            profile_start.elapsed().as_millis()
+        );
         Ok(())
     }
 
@@ -354,6 +413,8 @@ impl AudioFileFetch {
                 self.shared.set_ping_time(ping_time);
             }
             ReceivedData::Data(data) => {
+                let data_offset = data.offset;
+                let data_len = data.data.len();
                 match self.output.as_mut() {
                     Some(output) => {
                         output.seek(SeekFrom::Start(data.offset as u64))?;
@@ -364,7 +425,7 @@ impl AudioFileFetch {
 
                 let received_range = Range::new(data.offset, data.data.len());
 
-                let full = {
+                let (full, contiguous_from_start) = {
                     let mut download_status = self
                         .shared
                         .download_status
@@ -373,9 +434,17 @@ impl AudioFileFetch {
                     download_status.downloaded.add_range(&received_range);
                     self.shared.cond.notify_all();
 
-                    download_status.downloaded.contained_length_from_value(0)
-                        >= self.shared.file_size
+                    let contiguous_from_start =
+                        download_status.downloaded.contained_length_from_value(0);
+                    (
+                        contiguous_from_start >= self.shared.file_size,
+                        contiguous_from_start,
+                    )
                 };
+                info!(
+                    "[PlaybackProfile] audio_fetch:data written offset={} bytes={} contiguous_from_start={} file_size={} full={}",
+                    data_offset, data_len, contiguous_from_start, self.shared.file_size, full
+                );
 
                 if full {
                     self.finish()?;
@@ -427,6 +496,11 @@ pub(super) async fn audio_file_fetch(
     mut stream_loader_command_rx: mpsc::UnboundedReceiver<StreamLoaderCommand>,
     complete_tx: oneshot::Sender<NamedTempFile>,
 ) -> AudioFileResult {
+    let profile_start = Instant::now();
+    info!(
+        "[PlaybackProfile] audio_fetch:task start file_size={} initial_offset={} initial_length={}",
+        shared.file_size, initial_request.offset, initial_request.length
+    );
     let (file_data_tx, mut file_data_rx) = mpsc::unbounded_channel();
 
     {
@@ -517,5 +591,9 @@ pub(super) async fn audio_file_fetch(
         }
     }
 
+    info!(
+        "[PlaybackProfile] audio_fetch:task complete elapsed_ms={}",
+        profile_start.elapsed().as_millis()
+    );
     Ok(())
 }
