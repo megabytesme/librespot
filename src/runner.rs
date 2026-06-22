@@ -443,6 +443,75 @@ impl Runner {
         }
     }
 
+    fn try_load_offline_track(
+        &self,
+        player: &Player,
+        track_uri: &str,
+        play: bool,
+        position_ms: u32,
+    ) -> bool {
+        let t_uri = match SpotifyUri::from_uri(track_uri) {
+            Ok(uri) => uri,
+            Err(_) => return false,
+        };
+
+        let entry = self
+            .offline_index
+            .lock()
+            .ok()
+            .and_then(|index| index.get(track_uri).cloned());
+
+        let entry = match entry {
+            Some(entry) => entry,
+            None => return false,
+        };
+
+        let file_id = match parse_file_id_hex(&entry.file_id_hex) {
+            Some(file_id) => file_id,
+            None => {
+                log::warn!(
+                    "Offline index entry for <{}> has invalid file id <{}>",
+                    track_uri,
+                    entry.file_id_hex
+                );
+                return false;
+            }
+        };
+
+        let format = match AudioFileFormat::try_from(entry.format) {
+            Ok(format) => format,
+            Err(_) => {
+                log::warn!(
+                    "Offline index entry for <{}> has invalid audio format {}",
+                    track_uri,
+                    entry.format
+                );
+                return false;
+            }
+        };
+
+        log::info!(
+            "Loading persisted offline track <{}> without Spotify Connect transport",
+            track_uri
+        );
+        player.load_offline(
+            t_uri,
+            file_id,
+            format,
+            OfflineTrackMetadata {
+                name: entry.name.clone(),
+                artist: entry.artist.clone(),
+                album: entry.album.clone(),
+                cover_url: entry.cover_url.clone(),
+                duration_ms: entry.duration_ms,
+                is_explicit: entry.is_explicit,
+            },
+            play,
+            position_ms,
+        );
+        true
+    }
+
     pub async fn run(&mut self) {
         log::info!("Runner::run() starting");
 
@@ -572,6 +641,17 @@ impl Runner {
                                     .sync_write_pos
                                     .store(librespot_playback::audio_backend::get_write_pos(), Ordering::Release);
 
+                                let track_to_load = start_from_uri
+                                    .clone()
+                                    .unwrap_or_else(|| context_uri.clone());
+                                let loaded_direct_offline_track = start_from_uri.is_none()
+                                    && track_to_load.starts_with("spotify:track:")
+                                    && self.try_load_offline_track(&player, &track_to_load, play, 0);
+
+                                if loaded_direct_offline_track {
+                                    continue;
+                                }
+
                                 if let Some(ref s) = spirc {
                                     let _ = s.activate();
 
@@ -581,13 +661,11 @@ impl Runner {
                                         repeat_track: self.state.repeat.load(Ordering::Acquire) == 2,
                                     });
 
-                                    let target = start_from_uri.unwrap_or_else(|| context_uri.clone());
-
                                     let options = LoadRequestOptions {
                                         start_playing: play,
                                         seek_to: 0,
                                         context_options: Some(context_options),
-                                        playing_track: Some(PlayingTrack::Uri(target)),
+                                        playing_track: Some(PlayingTrack::Uri(track_to_load)),
                                     };
 
                                     let request = LoadRequest::from_context_uri(context_uri, options);
@@ -595,38 +673,8 @@ impl Runner {
                                         log::error!("Spirc load failed: {:?}", e);
                                     }
                                 } else {
-                                    let track_to_load = start_from_uri.unwrap_or(context_uri);
                                     if let Ok(t_uri) = SpotifyUri::from_uri(&track_to_load) {
-                                        let entry = self
-                                            .offline_index
-                                            .lock()
-                                            .ok()
-                                            .and_then(|index| index.get(&track_to_load).cloned());
-                                        if let Some(entry) = entry {
-                                            if let Some(file_id) = parse_file_id_hex(&entry.file_id_hex) {
-                                                if let Ok(format) = AudioFileFormat::try_from(entry.format) {
-                                                    player.load_offline(
-                                                        t_uri,
-                                                        file_id,
-                                                        format,
-                                                        OfflineTrackMetadata {
-                                                            name: entry.name.clone(),
-                                                            artist: entry.artist.clone(),
-                                                            album: entry.album.clone(),
-                                                            cover_url: entry.cover_url.clone(),
-                                                            duration_ms: entry.duration_ms,
-                                                            is_explicit: entry.is_explicit,
-                                                        },
-                                                        play,
-                                                        0,
-                                                    );
-                                                } else {
-                                                    player.load(t_uri, play, 0);
-                                                }
-                                            } else {
-                                                player.load(t_uri, play, 0);
-                                            }
-                                        } else {
+                                        if !self.try_load_offline_track(&player, &track_to_load, play, 0) {
                                             player.load(t_uri, play, 0);
                                         }
                                     }
