@@ -39,10 +39,13 @@ use std::{
     future::Future,
     sync::Arc,
     sync::atomic::{AtomicUsize, Ordering},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
-use tokio::{sync::mpsc, time::sleep};
+use tokio::{
+    sync::mpsc,
+    time::{MissedTickBehavior, interval, sleep, timeout},
+};
 
 #[derive(Debug, Error)]
 enum SpircError {
@@ -54,6 +57,10 @@ enum SpircError {
     InvalidUri(String),
     #[error("failed to put connect state for new device")]
     FailedDealerSetup,
+    #[error("timed out publishing Spotify Connect state")]
+    StateUpdateTimeout,
+    #[error("Spotify Connect state publication task failed: {0}")]
+    StateUpdateTaskFailed(String),
     #[error("unknown endpoint: {0:#?}")]
     UnknownEndpoint(serde_json::Value),
 }
@@ -63,7 +70,9 @@ impl From<SpircError> for Error {
         use SpircError::*;
         match err {
             NoData | NoUri(_) => Error::unavailable(err),
-            InvalidUri(_) | FailedDealerSetup => Error::aborted(err),
+            InvalidUri(_) | FailedDealerSetup | StateUpdateTimeout | StateUpdateTaskFailed(_) => {
+                Error::aborted(err)
+            }
             UnknownEndpoint(_) => Error::unimplemented(err),
         }
     }
@@ -109,6 +118,17 @@ struct SpircTask {
     /// when no other future resolves, otherwise resets the delay
     update_state: bool,
 
+    /// Spotify briefly publishes an empty active-device id while a transfer
+    /// is settling. Suppress local state publications during that window so
+    /// this device cannot accidentally reclaim playback.
+    suppress_state_updates_until: Option<Instant>,
+
+    /// An empty cluster update may be repeated while Spotify is settling.
+    /// Only arm the suppression window once until a concrete active device is
+    /// observed, otherwise every repeated empty update can postpone state
+    /// publication indefinitely.
+    empty_cluster_suppression_used: bool,
+
     spirc_id: usize,
 }
 
@@ -142,6 +162,15 @@ const CONTEXT_FETCH_THRESHOLD: usize = 2;
 const VOLUME_UPDATE_DELAY: Duration = Duration::from_millis(500);
 // to reduce updates to remote, we group some request by waiting for a set amount of time
 const UPDATE_STATE_DELAY: Duration = Duration::from_millis(200);
+const CONNECT_STATE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const CONNECT_TRANSFER_SETTLE_TIMEOUT: Duration = Duration::from_secs(15);
+const CONNECT_INACTIVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+const CONNECT_STATE_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn normalize_transfer_context_uri(uri: Option<&str>) -> Option<String> {
+    uri.filter(|value| !value.is_empty() && *value != "-")
+        .map(str::to_owned)
+}
 
 /// The spotify connect handle
 pub struct Spirc {
@@ -255,6 +284,8 @@ impl Spirc {
             transfer_state: None,
             update_volume: false,
             update_state: false,
+            suppress_state_updates_until: None,
+            empty_cluster_suppression_used: false,
 
             spirc_id,
         };
@@ -458,13 +489,25 @@ impl SpircTask {
             return;
         }
 
+        let mut state_heartbeat = interval(CONNECT_STATE_HEARTBEAT_INTERVAL);
+        state_heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        state_heartbeat.tick().await;
+
         while !self.session.is_invalid() && !self.shutdown {
             let commands = self.commands.as_mut();
             let player_events = self.player_events.as_mut();
 
             // when state and volume update have a higher priority than context resolving
             // because of that the context resolving has to wait, so that the other tasks can finish
-            let allow_context_resolving = !self.update_state && !self.update_volume;
+            let suppression_remaining = self
+                .suppress_state_updates_until
+                .and_then(|until| until.checked_duration_since(Instant::now()));
+            let state_updates_allowed = suppression_remaining.is_none();
+            if state_updates_allowed {
+                self.suppress_state_updates_until = None;
+            }
+            let allow_context_resolving =
+                (!self.update_state || !state_updates_allowed) && !self.update_volume;
 
             tokio::select! {
                 // startup of the dealer requires a connection_id, which is retrieved at the very beginning
@@ -532,12 +575,25 @@ impl SpircTask {
                         error!("could not dispatch player event: {e}");
                     }
                 },
-                _ = async { sleep(UPDATE_STATE_DELAY).await }, if self.update_state => {
+                _ = async { sleep(UPDATE_STATE_DELAY).await }, if self.update_state && state_updates_allowed => {
                     self.update_state = false;
 
                     if let Err(why) = self.notify().await {
                         error!("state update: {why}")
                     }
+                },
+                _ = state_heartbeat.tick(), if self.connect_established
+                    && self.connect_state.is_active()
+                    && !matches!(self.play_status, SpircPlayStatus::Stopped)
+                    && state_updates_allowed => {
+                    if let Err(why) = self.notify().await {
+                        error!("playback heartbeat state update: {why}")
+                    }
+                },
+                _ = async { sleep(suppression_remaining.unwrap_or_default()).await },
+                    if suppression_remaining.is_some() => {
+                    self.suppress_state_updates_until = None;
+                    self.update_state = true;
                 },
                 _ = async { sleep(VOLUME_UPDATE_DELAY).await }, if self.update_volume => {
                     self.update_volume = false;
@@ -690,7 +746,7 @@ impl SpircTask {
             SpircCommand::PlayPause => self.handle_play_pause(),
             SpircCommand::Pause => self.handle_pause(),
             SpircCommand::Prev => self.handle_prev()?,
-            SpircCommand::Next => self.handle_next(None)?,
+            SpircCommand::Next => self.handle_next(None, false)?,
             SpircCommand::VolumeUp => self.handle_volume_up(),
             SpircCommand::VolumeDown => self.handle_volume_down(),
             SpircCommand::Shuffle(shuffle) => self.handle_shuffle(shuffle)?,
@@ -738,7 +794,11 @@ impl SpircTask {
                     .repeat_track()
                     .then(|| self.connect_state.current_track(|t| t.uri.clone()));
 
-                self.handle_next(next_track)?
+                // A real end-of-track can only be emitted while the player is
+                // advancing.  Treat it as an authoritative continuation even
+                // if a locally-issued transport command left the serialized
+                // Connect status one event behind the player.
+                self.handle_next(next_track, true)?
             }
             PlayerEvent::Loading { .. } => match self.play_status {
                 SpircPlayStatus::LoadingPlay { position_ms } => {
@@ -778,7 +838,16 @@ impl SpircTask {
                             return Ok(());
                         }
                     }
-                    SpircPlayStatus::LoadingPlay { .. } | SpircPlayStatus::LoadingPause { .. } => {
+                    SpircPlayStatus::LoadingPlay { .. }
+                    | SpircPlayStatus::LoadingPause { .. }
+                    | SpircPlayStatus::Paused { .. }
+                    | SpircPlayStatus::Stopped => {
+                        // Runner-issued context loads stop the old player just
+                        // before queuing the new Spirc load. That old Stopped
+                        // event can race past the load and temporarily replace
+                        // LoadingPlay with Stopped. A Playing event carrying the
+                        // current play-request id is authoritative and must
+                        // recover the Connect state as well as local playback.
                         self.connect_state
                             .update_position(position_ms, self.now_ms());
                         self.play_status = SpircPlayStatus::Playing {
@@ -786,7 +855,6 @@ impl SpircTask {
                             preloading_of_next_track_triggered: false,
                         };
                     }
-                    _ => return Ok(()),
                 }
             }
             PlayerEvent::Paused {
@@ -828,7 +896,7 @@ impl SpircTask {
             PlayerEvent::Unavailable { track_id, .. } => {
                 self.handle_unavailable(&track_id)?;
                 if self.connect_state.current_track(|t| &t.uri) == &track_id.to_uri() {
-                    self.handle_next(None)?
+                    self.handle_next(None, false)?
                 }
             }
             _ => return Ok(()),
@@ -949,20 +1017,39 @@ impl SpircTask {
         );
 
         if let Some(cluster) = cluster_update.cluster.take() {
-            let became_inactive = self.connect_state.is_active()
-                && cluster.active_device_id != self.session.device_id();
-            if became_inactive {
-                info!("device became inactive");
-                self.handle_disconnect().await?;
-                self.handle_stop();
-            } else if self.connect_state.is_active() {
-                // fixme: workaround fix, because of missing information why it behaves like it does
-                //  background: when another device sends a connect-state update, some player's position de-syncs
-                //  tried: providing session_id, playback_id, track-metadata "track_player"
-                self.update_state = true;
+            if self.connect_state.is_active() {
+                if cluster.active_device_id.is_empty() {
+                    debug!("ignoring transitional cluster update with no active device");
+                    if !self.empty_cluster_suppression_used {
+                        self.empty_cluster_suppression_used = true;
+                        self.suppress_state_updates_until =
+                            Some(Instant::now() + CONNECT_TRANSFER_SETTLE_TIMEOUT);
+                        self.update_state = false;
+                    }
+                } else if cluster.active_device_id != self.session.device_id() {
+                    self.suppress_state_updates_until = None;
+                    self.empty_cluster_suppression_used = false;
+                    info!("device became inactive");
+                    self.handle_disconnect().await?;
+                    self.handle_stop();
+                } else {
+                    self.suppress_state_updates_until = None;
+                    self.empty_cluster_suppression_used = false;
+                    // fixme: workaround fix, because of missing information why it behaves like it does
+                    //  background: when another device sends a connect-state update, some player's position de-syncs
+                    //  tried: providing session_id, playback_id, track-metadata "track_player"
+                    self.update_state = true;
+                }
             }
         } else if self.connect_state.is_active() {
-            self.connect_state.became_inactive(&self.session).await?;
+            // Dealer updates can legitimately omit the cluster payload (for
+            // example, a partial metadata update). Absence is not evidence
+            // that another device took ownership. Resetting here made this
+            // device disappear from Connect while its audio kept playing and
+            // could leave the event loop blocked in the inactive-state PUT.
+            // A concrete, different active_device_id above is the authority
+            // for a real handoff.
+            debug!("ignoring Connect update with no cluster payload");
         }
 
         Ok(())
@@ -1030,15 +1117,17 @@ impl SpircTask {
 
                 let context = match play.context.uri {
                     Some(s) => PlayContext::Uri(s),
-                    None if !play.context.pages.is_empty() => PlayContext::Tracks(
-                        play.context
+                    None if !play.context.pages.is_empty() => PlayContext::Tracks {
+                        tracks: play
+                            .context
                             .pages
                             .iter()
                             .cloned()
                             .flat_map(|p| p.tracks)
                             .flat_map(|t| t.uri)
                             .collect(),
-                    ),
+                        context_uri: None,
+                    },
                     None => Err(SpircError::NoUri("context"))?,
                 };
 
@@ -1105,7 +1194,7 @@ impl SpircTask {
                     self.handle_shuffle(shuffle)?;
                 }
             }
-            SkipNext(skip_next) => self.handle_next(skip_next.track.map(|t| t.uri))?,
+            SkipNext(skip_next) => self.handle_next(skip_next.track.map(|t| t.uri), false)?,
             SkipPrev(_) => self.handle_prev()?,
             Resume(_) if matches!(self.play_status, SpircPlayStatus::Stopped) => {
                 self.load_track(true, 0)?
@@ -1118,12 +1207,11 @@ impl SpircTask {
     }
 
     fn handle_transfer(&mut self, mut transfer: TransferState) -> Result<(), Error> {
-        let mut ctx_uri = match transfer.current_session.context.uri {
-            None => Err(SpircError::NoUri("transfer context"))?,
-            // can apparently happen when a state is transferred and was started with "uris" via the api
-            Some(ref uri) if uri == "-" || uri.is_empty() => None,
-            Some(ref uri) => Some(uri.clone()),
-        };
+        // Context-less playback is valid (for example, a track started from
+        // an ad-hoc URI list). In that case the transferred current track and
+        // queue below are sufficient to rebuild a playable local context.
+        let mut ctx_uri =
+            normalize_transfer_context_uri(transfer.current_session.context.uri.as_deref());
 
         self.connect_state.reset_context(
             ctx_uri
@@ -1168,7 +1256,7 @@ impl SpircTask {
                     .collect::<Vec<_>>();
 
                 if !all_tracks.is_empty() {
-                    self.load_context_from_tracks(all_tracks)?;
+                    self.load_context_from_tracks(all_tracks, None)?;
                 } else {
                     warn!(
                         "tried to transfer with an invalid state, using fallback as ctx_uri ({fallback})"
@@ -1245,9 +1333,27 @@ impl SpircTask {
         self.play_status = SpircPlayStatus::Stopped {};
         self.connect_state
             .update_position_in_relation(self.now_ms());
-        self.notify().await?;
 
-        self.connect_state.became_inactive(&self.session).await?;
+        // Another device already owns the cluster. Publishing one final
+        // active (stopped) state here can win the ownership race and reclaim
+        // playback just before the inactive update. Transition directly to
+        // inactive instead.
+        self.connect_state.prepare_to_become_inactive();
+        let session = self.session.clone();
+        let mut publication =
+            tokio::spawn(async move { session.spclient().put_connect_state_inactive(false).await });
+        match timeout(CONNECT_INACTIVE_REQUEST_TIMEOUT, &mut publication).await {
+            Ok(Ok(Ok(_))) => {}
+            Ok(Ok(Err(why))) => warn!("failed publishing inactive Connect state: {why}"),
+            Ok(Err(why)) => warn!("inactive Connect state publication task failed: {why}"),
+            Err(_) => {
+                publication.abort();
+                warn!(
+                    "timed out publishing inactive Connect state after {:?}",
+                    CONNECT_INACTIVE_REQUEST_TIMEOUT
+                );
+            }
+        }
 
         self.player
             .emit_session_disconnected_event(self.session.connection_id(), self.session.username());
@@ -1300,12 +1406,14 @@ impl SpircTask {
         page: Option<ContextPage>,
         fallback_index: Option<usize>,
     ) -> Result<(), Error> {
-        self.connect_state
-            .reset_context(if let PlayContext::Uri(ref uri) = cmd.context {
-                ResetContext::WhenDifferent(uri)
-            } else {
-                ResetContext::Completely
-            });
+        self.connect_state.reset_context(match &cmd.context {
+            PlayContext::Uri(uri) => ResetContext::WhenDifferent(uri),
+            PlayContext::Tracks {
+                context_uri: Some(uri),
+                ..
+            } => ResetContext::WhenDifferent(uri),
+            PlayContext::Tracks { .. } => ResetContext::Completely,
+        });
 
         self.connect_state.reset_options();
 
@@ -1315,7 +1423,10 @@ impl SpircTask {
                 self.load_context_from_uri(uri, page.as_ref(), autoplay)
                     .await?
             }
-            PlayContext::Tracks(tracks) => self.load_context_from_tracks(tracks)?,
+            PlayContext::Tracks {
+                tracks,
+                context_uri,
+            } => self.load_context_from_tracks(tracks, context_uri.as_deref())?,
         }
 
         let cmd_options = cmd.options;
@@ -1446,12 +1557,19 @@ impl SpircTask {
         Ok(())
     }
 
-    fn load_context_from_tracks(&mut self, tracks: impl Into<ContextPage>) -> Result<(), Error> {
+    fn load_context_from_tracks(
+        &mut self,
+        tracks: impl Into<ContextPage>,
+        source_context_uri: Option<&str>,
+    ) -> Result<(), Error> {
         const WEB_API_URI: &str = "spotify:web-api";
+        let context_uri = source_context_uri
+            .filter(|uri| !uri.is_empty())
+            .unwrap_or(WEB_API_URI);
         let ctx = Context {
             // by providing values for uri/url the player in the official client's isn't frozen
-            uri: Some(WEB_API_URI.into()),
-            url: Some(format!("context://{WEB_API_URI}")),
+            uri: Some(context_uri.into()),
+            url: Some(format!("context://{context_uri}")),
             pages: vec![tracks.into()],
             ..Default::default()
         };
@@ -1668,8 +1786,19 @@ impl SpircTask {
         self.context_resolver.add(resolve);
     }
 
-    fn handle_next(&mut self, track_uri: Option<String>) -> Result<(), Error> {
-        let continue_playing = self.connect_state.is_playing();
+    fn handle_next(
+        &mut self,
+        track_uri: Option<String>,
+        force_continue_playing: bool,
+    ) -> Result<(), Error> {
+        // Player end-of-track is the authoritative boundary. The serialized
+        // ConnectState protobuf may briefly lag behind the local play status,
+        // which previously allowed an automatic next track to be loaded paused.
+        let continue_playing = force_continue_playing
+            || matches!(
+                self.play_status,
+                SpircPlayStatus::Playing { .. } | SpircPlayStatus::LoadingPlay { .. }
+            );
 
         let current_uri = self.connect_state.current_track(|t| &t.uri);
         let mut has_next_track =
@@ -1857,10 +1986,25 @@ impl SpircTask {
 
         self.connect_state.set_now(self.now_ms() as u64);
 
-        self.connect_state
-            .send_state(&self.session)
-            .await
-            .map(|_| ())
+        // A Connect state PUT can occasionally stop making progress on UWP.
+        // Never let that network request monopolize the Spirc event loop: the
+        // same loop must remain available for remote seek/transport commands
+        // and player events. A later heartbeat will retry the publication.
+        let request = self.connect_state.request_snapshot();
+        let session = self.session.clone();
+        let mut publication =
+            tokio::spawn(
+                async move { session.spclient().put_connect_state_request(&request).await },
+            );
+
+        match timeout(CONNECT_STATE_REQUEST_TIMEOUT, &mut publication).await {
+            Ok(Ok(result)) => result.map(|_| ()).map_err(Into::into),
+            Ok(Err(why)) => Err(SpircError::StateUpdateTaskFailed(why.to_string()).into()),
+            Err(_) => {
+                publication.abort();
+                Err(SpircError::StateUpdateTimeout.into())
+            }
+        }
     }
 
     fn set_volume(&mut self, volume: u16) {
@@ -1886,5 +2030,25 @@ impl SpircTask {
 impl Drop for SpircTask {
     fn drop(&mut self) {
         debug!("drop Spirc[{}]", self.spirc_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_transfer_context_uri;
+
+    #[test]
+    fn contextless_transfer_uses_track_fallback() {
+        assert_eq!(normalize_transfer_context_uri(None), None);
+        assert_eq!(normalize_transfer_context_uri(Some("")), None);
+        assert_eq!(normalize_transfer_context_uri(Some("-")), None);
+    }
+
+    #[test]
+    fn transfer_preserves_usable_context_uri() {
+        assert_eq!(
+            normalize_transfer_context_uri(Some("spotify:playlist:example")),
+            Some("spotify:playlist:example".to_owned())
+        );
     }
 }

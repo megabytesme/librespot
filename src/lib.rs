@@ -13,8 +13,8 @@ use librespot_core::{FileId, cache::Cache};
 use std::ffi::{CStr, CString, c_char};
 use std::os::raw::c_void;
 use std::sync::Arc;
-use std::sync::mpsc as std_mpsc;
 use std::sync::atomic::Ordering;
+use std::sync::mpsc as std_mpsc;
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use tokio::sync::mpsc;
@@ -93,7 +93,11 @@ fn request_appdata(
         }
         Ok(Err(err)) => {
             set_last_error(err.clone());
-            log::error!("librespot appdata request failed for kind {}: {}", kind, err);
+            log::error!(
+                "librespot appdata request failed for kind {}: {}",
+                kind,
+                err
+            );
             Err(err)
         }
         Err(err) => {
@@ -318,9 +322,27 @@ macro_rules! appdata_typed_get {
     };
 }
 
-appdata_typed_get!(librespot_track_get, 1, AppDataPayload::Track, alloc_ffi_track, FfiTrack);
-appdata_typed_get!(librespot_album_get, 2, AppDataPayload::Album, alloc_ffi_album, FfiAlbum);
-appdata_typed_get!(librespot_artist_get, 3, AppDataPayload::Artist, alloc_ffi_artist, FfiArtist);
+appdata_typed_get!(
+    librespot_track_get,
+    1,
+    AppDataPayload::Track,
+    alloc_ffi_track,
+    FfiTrack
+);
+appdata_typed_get!(
+    librespot_album_get,
+    2,
+    AppDataPayload::Album,
+    alloc_ffi_album,
+    FfiAlbum
+);
+appdata_typed_get!(
+    librespot_artist_get,
+    3,
+    AppDataPayload::Artist,
+    alloc_ffi_artist,
+    FfiArtist
+);
 appdata_typed_get!(
     librespot_playlist_get,
     4,
@@ -349,7 +371,13 @@ appdata_typed_get!(
     alloc_ffi_track_list,
     FfiTrackList
 );
-appdata_typed_get!(librespot_search_get, 8, AppDataPayload::Search, alloc_ffi_search, FfiSearch);
+appdata_typed_get!(
+    librespot_search_get,
+    8,
+    AppDataPayload::Search,
+    alloc_ffi_search,
+    FfiSearch
+);
 appdata_typed_get!(
     librespot_followed_artists_get,
     9,
@@ -635,6 +663,57 @@ pub unsafe extern "C" fn librespot_load(
         LibrespotCommand::Load {
             context_uri: context_str,
             start_from_uri: start_str,
+            ordered_track_uris: None,
+            play,
+        },
+    );
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn librespot_load_tracks(
+    instance: *mut LibrespotInstance,
+    context_uri: *const c_char,
+    tracks_json: *const c_char,
+    start_uri: *const c_char,
+    play: bool,
+) {
+    if context_uri.is_null() || tracks_json.is_null() {
+        set_last_error("context_uri or tracks_json pointer was null");
+        return;
+    }
+
+    let context_str = unsafe { CStr::from_ptr(context_uri) }
+        .to_string_lossy()
+        .into_owned();
+    let tracks_str = unsafe { CStr::from_ptr(tracks_json) }.to_string_lossy();
+    let ordered_track_uris = match serde_json::from_str::<Vec<String>>(&tracks_str) {
+        Ok(tracks) if !tracks.is_empty() => tracks,
+        Ok(_) => {
+            set_last_error("ordered track list was empty");
+            return;
+        }
+        Err(err) => {
+            set_last_error(format!("invalid ordered track JSON: {err}"));
+            return;
+        }
+    };
+
+    let start_str = if !start_uri.is_null() {
+        Some(
+            unsafe { CStr::from_ptr(start_uri) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    } else {
+        None
+    };
+
+    send_cmd(
+        instance,
+        LibrespotCommand::Load {
+            context_uri: context_str,
+            start_from_uri: start_str,
+            ordered_track_uris: Some(ordered_track_uris),
             play,
         },
     );

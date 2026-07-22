@@ -22,7 +22,10 @@ impl Deref for LoadRequest {
 #[derive(Debug, Clone)]
 pub(super) enum PlayContext {
     Uri(String),
-    Tracks(Vec<String>),
+    Tracks {
+        tracks: Vec<String>,
+        context_uri: Option<String>,
+    },
 }
 
 /// The parameters for creating a load request
@@ -102,7 +105,26 @@ impl LoadRequest {
     /// and providing `uris`
     pub fn from_tracks(tracks: Vec<String>, options: LoadRequestOptions) -> Self {
         Self {
-            context: PlayContext::Tracks(tracks),
+            context: PlayContext::Tracks {
+                tracks,
+                context_uri: None,
+            },
+            options,
+        }
+    }
+
+    /// Create a load request from an ordered set of tracks while retaining
+    /// the source context shown to other Spotify Connect clients.
+    pub fn from_tracks_with_context_uri(
+        tracks: Vec<String>,
+        context_uri: String,
+        options: LoadRequestOptions,
+    ) -> Self {
+        Self {
+            context: PlayContext::Tracks {
+                tracks,
+                context_uri: Some(context_uri),
+            },
             options,
         }
     }
@@ -143,6 +165,31 @@ impl TryFrom<SkipTo> for PlayingTrack {
             Ok(PlayingTrack::Index(index))
         } else {
             Err(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LoadRequest, LoadRequestOptions, PlayContext};
+
+    #[test]
+    fn ordered_tracks_can_preserve_their_source_context() {
+        let request = LoadRequest::from_tracks_with_context_uri(
+            vec!["spotify:track:one".to_owned()],
+            "spotify:playlist:source".to_owned(),
+            LoadRequestOptions::default(),
+        );
+
+        match request.context {
+            PlayContext::Tracks {
+                tracks,
+                context_uri,
+            } => {
+                assert_eq!(tracks, vec!["spotify:track:one"]);
+                assert_eq!(context_uri.as_deref(), Some("spotify:playlist:source"));
+            }
+            PlayContext::Uri(_) => panic!("ordered tracks were converted to a URI-only load"),
         }
     }
 }

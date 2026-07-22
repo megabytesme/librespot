@@ -456,11 +456,9 @@ impl ConnectState {
         player.timestamp = timestamp;
     }
 
-    pub async fn became_inactive(&mut self, session: &Session) -> SpClientResult {
+    pub fn prepare_to_become_inactive(&mut self) {
         self.reset();
         self.reset_context(ResetContext::Completely);
-
-        session.spclient().put_connect_state_inactive(false).await
     }
 
     async fn send_with_reason(
@@ -495,5 +493,11 @@ impl ConnectState {
             .spclient()
             .put_connect_state_request(&self.request)
             .await
+    }
+
+    /// Takes an owned snapshot so routine state publication can run outside
+    /// the latency-sensitive Spirc command/event loop.
+    pub fn request_snapshot(&self) -> PutStateRequest {
+        self.request.clone()
     }
 }

@@ -52,6 +52,7 @@ pub enum LibrespotCommand {
     Load {
         context_uri: String,
         start_from_uri: Option<String>,
+        ordered_track_uris: Option<Vec<String>>,
         play: bool,
     },
     Play,
@@ -635,7 +636,7 @@ impl Runner {
                                 let _ = s.repeat_track(enabled).map_err(|e| log::error!("Failed to set repeat track: {:?}", e));
                             }
                         }
-                        LibrespotCommand::Load { context_uri, start_from_uri, play } => {
+                        LibrespotCommand::Load { context_uri, start_from_uri, ordered_track_uris, play } => {
                             if let Ok(_ctx_uri) = SpotifyUri::from_uri(&context_uri) {
                                 player.stop();
                                 self.state.position_ms.store(0, Ordering::Release);
@@ -670,7 +671,16 @@ impl Runner {
                                         playing_track: Some(PlayingTrack::Uri(track_to_load)),
                                     };
 
-                                    let request = LoadRequest::from_context_uri(context_uri, options);
+                                    let request = match ordered_track_uris {
+                                        Some(tracks) if !tracks.is_empty() => {
+                                            LoadRequest::from_tracks_with_context_uri(
+                                                tracks,
+                                                context_uri,
+                                                options,
+                                            )
+                                        }
+                                        _ => LoadRequest::from_context_uri(context_uri, options),
+                                    };
                                     if let Err(e) = s.load(request) {
                                         log::error!("Spirc load failed: {:?}", e);
                                     }
@@ -859,6 +869,20 @@ impl Runner {
                         event_type: EventType::SessionDisconnected,
                         data: unsafe { std::mem::zeroed() }
                     });
+
+                    if last_creds.is_some() {
+                        let retry_delay = connect_backoff;
+                        connecting = true;
+                        next_connect_attempt = Instant::now() + retry_delay;
+                        connect_backoff = std::cmp::min(
+                            connect_backoff.saturating_mul(2),
+                            Duration::from_secs(30),
+                        );
+                        log::warn!(
+                            "Spirc task ended unexpectedly. Reconnecting in {:?}.",
+                            retry_delay
+                        );
+                    }
                 }
             }
         }
