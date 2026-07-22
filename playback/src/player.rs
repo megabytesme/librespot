@@ -743,6 +743,41 @@ enum PlayerPreload {
 
 type Decoder = Box<dyn AudioDecoder + Send>;
 
+const POSITION_CORRECTION_TOLERANCE_MS: u32 = 1000;
+
+/// Tracks an authoritative media position plus a monotonic timestamp. Keeping
+/// these as a pair avoids subtracting an arbitrary (and possibly larger) track
+/// position from Instant's opaque epoch, which can fail on short-uptime UWP
+/// devices and previously caused one PositionCorrection event per packet.
+struct PlaybackPositionClock {
+    anchor_position_ms: u32,
+    anchor_instant: Instant,
+}
+
+impl PlaybackPositionClock {
+    fn new(position_ms: u32) -> Self {
+        Self {
+            anchor_position_ms: position_ms,
+            anchor_instant: Instant::now(),
+        }
+    }
+
+    fn reset(&mut self, position_ms: u32, now: Instant) {
+        self.anchor_position_ms = position_ms;
+        self.anchor_instant = now;
+    }
+
+    fn is_behind_tolerance(&self, position_ms: u32, now: Instant) -> bool {
+        let elapsed_ms = now
+            .saturating_duration_since(self.anchor_instant)
+            .as_millis()
+            .min(u32::MAX as u128) as u32;
+        let expected_position_ms = self.anchor_position_ms.saturating_add(elapsed_ms);
+
+        expected_position_ms.saturating_sub(position_ms) >= POSITION_CORRECTION_TOLERANCE_MS
+    }
+}
+
 enum PlayerState {
     Stopped,
     Loading {
@@ -776,7 +811,7 @@ enum PlayerState {
         bytes_per_second: usize,
         duration_ms: u32,
         stream_position_ms: u32,
-        reported_nominal_start_time: Option<Instant>,
+        reported_position: PlaybackPositionClock,
         suggested_to_preload_next_track: bool,
         is_explicit: bool,
     },
@@ -898,8 +933,7 @@ impl PlayerState {
                     duration_ms,
                     bytes_per_second,
                     stream_position_ms,
-                    reported_nominal_start_time: Instant::now()
-                        .checked_sub(Duration::from_millis(stream_position_ms as u64)),
+                    reported_position: PlaybackPositionClock::new(stream_position_ms),
                     suggested_to_preload_next_track,
                     is_explicit,
                 };
@@ -1580,7 +1614,7 @@ impl Future for PlayerInternal {
                     ref mut decoder,
                     normalisation_factor,
                     ref mut stream_position_ms,
-                    ref mut reported_nominal_start_time,
+                    ref mut reported_position,
                     ..
                 } = self.state
                 {
@@ -1597,52 +1631,24 @@ impl Future for PlayerInternal {
                                 if !passthrough {
                                     match packet.samples() {
                                         Ok(_) => {
-                                            let new_stream_position = Duration::from_millis(
-                                                new_stream_position_ms as u64,
-                                            );
-
                                             let now = Instant::now();
 
                                             // Only notify if we're skipped some packets *or* we are behind.
                                             // If we're ahead it's probably due to a buffer of the backend
                                             // and we're actually in time.
-                                            let notify_about_position =
-                                                match *reported_nominal_start_time {
-                                                    None => true,
-                                                    Some(reported_nominal_start_time) => {
-                                                        let mut notify = false;
-
-                                                        if packet_position.skipped {
-                                                            if let Some(ahead) = new_stream_position
-                                                                .checked_sub(Duration::from_millis(
-                                                                    expected_position_ms as u64,
-                                                                ))
-                                                            {
-                                                                notify |=
-                                                                    ahead >= Duration::from_secs(1)
-                                                            }
-                                                        }
-
-                                                        if let Some(lag) = now
-                                                            .checked_duration_since(
-                                                                reported_nominal_start_time,
-                                                            )
-                                                        {
-                                                            if let Some(lag) =
-                                                                lag.checked_sub(new_stream_position)
-                                                            {
-                                                                notify |=
-                                                                    lag >= Duration::from_secs(1)
-                                                            }
-                                                        }
-
-                                                        notify
-                                                    }
-                                                };
+                                            let skipped_ahead = packet_position.skipped
+                                                && new_stream_position_ms
+                                                    .saturating_sub(expected_position_ms)
+                                                    >= POSITION_CORRECTION_TOLERANCE_MS;
+                                            let notify_about_position = skipped_ahead
+                                                || reported_position.is_behind_tolerance(
+                                                    new_stream_position_ms,
+                                                    now,
+                                                );
 
                                             if notify_about_position {
-                                                *reported_nominal_start_time =
-                                                    now.checked_sub(new_stream_position);
+                                                reported_position
+                                                    .reset(new_stream_position_ms, now);
                                                 self.send_event(PlayerEvent::PositionCorrection {
                                                     play_request_id,
                                                     track_id: track_id.clone(),
@@ -2063,8 +2069,7 @@ impl PlayerInternal {
                 duration_ms: loaded_track.duration_ms,
                 bytes_per_second: loaded_track.bytes_per_second,
                 stream_position_ms: loaded_track.stream_position_ms,
-                reported_nominal_start_time: Instant::now()
-                    .checked_sub(Duration::from_millis(position_ms as u64)),
+                reported_position: PlaybackPositionClock::new(position_ms),
                 suggested_to_preload_next_track: false,
                 is_explicit: loaded_track.is_explicit,
             };
@@ -2437,6 +2442,14 @@ impl PlayerInternal {
         }
 
         if let Some((play_request_id, track_id, new_position_ms)) = seek_event {
+            if let PlayerState::Playing {
+                ref mut reported_position,
+                ..
+            } = self.state
+            {
+                reported_position.reset(new_position_ms, Instant::now());
+            }
+
             let audio_generation = self.sink.begin_generation();
             self.send_event(PlayerEvent::Seeked {
                 play_request_id,
@@ -2448,15 +2461,6 @@ impl PlayerInternal {
 
         // ensure we have a bit of a buffer of downloaded data
         self.preload_data_before_playback()?;
-
-        if let PlayerState::Playing {
-            ref mut reported_nominal_start_time,
-            ..
-        } = self.state
-        {
-            *reported_nominal_start_time =
-                Instant::now().checked_sub(Duration::from_millis(position_ms as u64));
-        }
 
         Ok(())
     }
@@ -2920,5 +2924,31 @@ where
 
     fn byte_len(&self) -> Option<u64> {
         Some(self.length)
+    }
+}
+
+#[cfg(test)]
+mod position_clock_tests {
+    use super::*;
+
+    #[test]
+    fn forward_seek_does_not_depend_on_instant_epoch() {
+        let mut clock = PlaybackPositionClock::new(84_374);
+        let anchor = clock.anchor_instant;
+
+        assert!(!clock.is_behind_tolerance(84_374, anchor));
+        assert!(!clock.is_behind_tolerance(84_873, anchor + Duration::from_millis(500)));
+
+        clock.reset(93_631, anchor + Duration::from_secs(10));
+        assert!(!clock.is_behind_tolerance(93_881, anchor + Duration::from_millis(10_250)));
+    }
+
+    #[test]
+    fn correction_requires_documented_one_second_drift() {
+        let clock = PlaybackPositionClock::new(10_000);
+        let anchor = clock.anchor_instant;
+
+        assert!(!clock.is_behind_tolerance(10_001, anchor + Duration::from_millis(999)));
+        assert!(clock.is_behind_tolerance(10_000, anchor + Duration::from_millis(1000)));
     }
 }
