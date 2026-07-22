@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex, atomic::AtomicU8};
 use std::{
@@ -361,6 +361,7 @@ pub struct RunnerState {
     pub current_track: RwLock<Option<TrackMetadataInternal>>,
     pub sample_rate: AtomicU32,
     pub bytes_per_sample: AtomicU8,
+    pub audio_generation: AtomicU64,
 }
 
 impl RunnerState {
@@ -385,6 +386,7 @@ impl RunnerState {
             current_track: RwLock::new(None),
             sample_rate: AtomicU32::new(sample_rate),
             bytes_per_sample: AtomicU8::new(bytes),
+            audio_generation: AtomicU64::new(0),
         }
     }
 }
@@ -761,7 +763,7 @@ impl Runner {
                 }
 
                 Some(event) = player_rx.recv() => {
-                    if let PlayerEvent::TrackChanged { ref audio_item } = event {
+                    if let PlayerEvent::TrackChanged { ref audio_item, .. } = event {
                         let track_uri = audio_item.uri.clone();
                         let lyrics_session = session.clone();
                         let offline_index = self.offline_index.clone();
@@ -877,6 +879,17 @@ impl Runner {
     fn handle_player_event(&self, event: PlayerEvent) {
         let mut data: EventData = unsafe { std::mem::zeroed() };
         let mut temp_strings: Vec<CString> = Vec::new();
+        let event_audio_generation = match &event {
+            PlayerEvent::Seeked {
+                audio_generation, ..
+            }
+            | PlayerEvent::TrackChanged {
+                audio_generation, ..
+            } => Some(*audio_generation),
+            _ => None,
+        };
+        data.audio_generation = event_audio_generation
+            .unwrap_or_else(|| self.state.audio_generation.load(Ordering::Acquire));
 
         match event {
             PlayerEvent::Playing {
@@ -898,6 +911,7 @@ impl Runner {
                 play_request_id,
                 ref track_id,
                 position_ms,
+                ..
             }
             | PlayerEvent::PositionCorrection {
                 play_request_id,
@@ -920,6 +934,13 @@ impl Runner {
                 data.play_request_id = play_request_id;
                 data.position_ms = position_ms;
 
+                if let Some(audio_generation) = event_audio_generation {
+                    data.audio_generation = audio_generation;
+                    self.state
+                        .audio_generation
+                        .store(audio_generation, Ordering::Release);
+                }
+
                 let event_type = match event {
                     PlayerEvent::Playing { .. } => {
                         self.state.is_playing.store(true, Ordering::Release);
@@ -940,7 +961,12 @@ impl Runner {
                 self.emit(LibrespotEvent { event_type, data });
             }
 
-            PlayerEvent::TrackChanged { audio_item } => {
+            PlayerEvent::TrackChanged {
+                audio_item,
+                play_request_id,
+                audio_generation,
+                was_preloaded,
+            } => {
                 let duration = audio_item.duration_ms as u32;
                 self.state.duration_ms.store(duration, Ordering::Relaxed);
                 self.state.position_ms.store(0, Ordering::Release);
@@ -948,6 +974,9 @@ impl Runner {
                     librespot_playback::audio_backend::get_write_pos(),
                     Ordering::Release,
                 );
+                self.state
+                    .audio_generation
+                    .store(audio_generation, Ordering::Release);
 
                 let artist_name = match &audio_item.unique_fields {
                     librespot_metadata::audio::UniqueFields::Track { artists, .. } => artists
@@ -991,6 +1020,9 @@ impl Runner {
 
                 data.duration_ms = duration;
                 data.track = ManuallyDrop::new(meta);
+                data.play_request_id = play_request_id;
+                data.audio_generation = audio_generation;
+                data.was_preloaded = was_preloaded;
 
                 self.emit(LibrespotEvent {
                     event_type: EventType::TrackChanged,

@@ -99,6 +99,8 @@ pub struct EventData {
     pub session_user: *const c_char,
     pub client_name: *const c_char,
     pub log_msg: *const c_char,
+    pub audio_generation: u64,
+    pub was_preloaded: bool,
 }
 
 #[repr(C)]

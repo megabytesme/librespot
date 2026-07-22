@@ -244,9 +244,13 @@ pub enum PlayerEvent {
         play_request_id: u64,
         track_id: SpotifyUri,
         position_ms: u32,
+        audio_generation: u64,
     },
     TrackChanged {
         audio_item: Box<AudioItem>,
+        play_request_id: u64,
+        audio_generation: u64,
+        was_preloaded: bool,
     },
     SessionConnected {
         connection_id: String,
@@ -306,6 +310,9 @@ impl PlayerEvent {
                 play_request_id, ..
             }
             | Seeked {
+                play_request_id, ..
+            }
+            | TrackChanged {
                 play_request_id, ..
             } => Some(*play_request_id),
             _ => None,
@@ -1505,6 +1512,7 @@ impl Future for PlayerInternal {
                                 play_request_id,
                                 loaded_track,
                                 start_playback,
+                                false,
                             );
                             if let PlayerState::Loading { .. } = self.state {
                                 error!("The state wasn't changed by start_playback()");
@@ -2011,10 +2019,17 @@ impl PlayerInternal {
         play_request_id: u64,
         loaded_track: PlayerLoadedTrackData,
         start_playback: bool,
+        was_preloaded: bool,
     ) {
         let audio_item = Box::new(loaded_track.audio_item.clone());
+        let audio_generation = self.sink.begin_generation();
 
-        self.send_event(PlayerEvent::TrackChanged { audio_item });
+        self.send_event(PlayerEvent::TrackChanged {
+            audio_item,
+            play_request_id,
+            audio_generation,
+            was_preloaded,
+        });
 
         let position_ms = loaded_track.stream_position_ms;
 
@@ -2128,7 +2143,7 @@ impl PlayerInternal {
                     loaded_track.stream_position_ms = loaded_track.decoder.seek(position_ms)?;
                 }
                 self.preload = PlayerPreload::None;
-                self.start_playback(track_id, play_request_id, loaded_track, play);
+                self.start_playback(track_id, play_request_id, loaded_track, play, false);
                 if let PlayerState::Invalid = self.state {
                     return Err(Error::internal(format!(
                         "PlayerInternal::handle_command_load repeating the same track: start_playback() did not transition to valid player state: {:?}",
@@ -2199,7 +2214,7 @@ impl PlayerInternal {
                     };
 
                     self.preload = PlayerPreload::None;
-                    self.start_playback(track_id, play_request_id, loaded_track, play);
+                    self.start_playback(track_id, play_request_id, loaded_track, play, false);
 
                     if let PlayerState::Invalid = self.state {
                         return Err(Error::internal(format!(
@@ -2235,7 +2250,7 @@ impl PlayerInternal {
                         // This may be blocking
                         loaded_track.stream_position_ms = loaded_track.decoder.seek(position_ms)?;
                     }
-                    self.start_playback(track_id, play_request_id, *loaded_track, play);
+                    self.start_playback(track_id, play_request_id, *loaded_track, play, true);
                     return Ok(());
                 } else {
                     return Err(Error::internal(format!(
@@ -2394,6 +2409,7 @@ impl PlayerInternal {
             );
         }
 
+        let mut seek_event = None;
         if let Some(decoder) = self.state.decoder() {
             match decoder.seek(position_ms) {
                 Ok(new_position_ms) => {
@@ -2411,18 +2427,23 @@ impl PlayerInternal {
                     } = self.state
                     {
                         *stream_position_ms = new_position_ms;
-
-                        self.send_event(PlayerEvent::Seeked {
-                            play_request_id,
-                            track_id: track_id.clone(),
-                            position_ms: new_position_ms,
-                        });
+                        seek_event = Some((play_request_id, track_id.clone(), new_position_ms));
                     }
                 }
                 Err(e) => error!("PlayerInternal::handle_command_seek error: {e}"),
             }
         } else {
             error!("Player::seek called from invalid state: {:?}", self.state);
+        }
+
+        if let Some((play_request_id, track_id, new_position_ms)) = seek_event {
+            let audio_generation = self.sink.begin_generation();
+            self.send_event(PlayerEvent::Seeked {
+                play_request_id,
+                track_id,
+                position_ms: new_position_ms,
+                audio_generation,
+            });
         }
 
         // ensure we have a bit of a buffer of downloaded data

@@ -4,15 +4,22 @@ use crate::convert::Converter;
 use crate::decoder::AudioPacket;
 
 use std::ptr;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
 const BUFFER_SIZE: usize = 128 * 1024;
 
 static mut AUDIO_BUFFER: *mut u8 = ptr::null_mut();
-static WRITE_POS: AtomicUsize = AtomicUsize::new(0);
-static READ_POS: AtomicUsize = AtomicUsize::new(0);
+// Monotonic sequences make full and empty unambiguous and let the managed
+// consumer retain a precise boundary between adjacent decoded tracks.
+static WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static READ_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+static GENERATION_START_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+// Even values are stable. Odd values mean a generation boundary is being
+// published. This provides one coherent FFI snapshot without a mutex.
+static STATE_VERSION: AtomicU32 = AtomicU32::new(0);
 
 static AUDIO_FORMAT: AtomicU32 = AtomicU32::new(0);
 static SAMPLE_RATE: AtomicU32 = AtomicU32::new(44100);
@@ -69,6 +76,15 @@ impl Open for UwpSink {
 }
 
 impl Sink for UwpSink {
+    fn begin_generation(&mut self) -> u64 {
+        STATE_VERSION.fetch_add(1, Ordering::AcqRel);
+        let start_sequence = WRITE_SEQUENCE.load(Ordering::Acquire);
+        GENERATION_START_SEQUENCE.store(start_sequence, Ordering::Release);
+        let generation = GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+        STATE_VERSION.fetch_add(1, Ordering::Release);
+        generation
+    }
+
     sink_as_bytes!();
 }
 
@@ -83,10 +99,10 @@ impl SinkAsBytes for UwpSink {
             let cap = BUFFER_SIZE;
 
             loop {
-                let wp = WRITE_POS.load(Ordering::Acquire);
-                let rp = READ_POS.load(Ordering::Acquire);
-                let used = (cap + wp - rp) % cap;
-                let free = cap - used - 1;
+                let wp = WRITE_SEQUENCE.load(Ordering::Acquire);
+                let rp = READ_SEQUENCE.load(Ordering::Acquire);
+                let used = wp.saturating_sub(rp).min(cap as u64) as usize;
+                let free = cap - used;
 
                 if free >= len {
                     break;
@@ -96,7 +112,8 @@ impl SinkAsBytes for UwpSink {
                 }
             }
 
-            let wp = WRITE_POS.load(Ordering::Acquire);
+            let write_sequence = WRITE_SEQUENCE.load(Ordering::Acquire);
+            let wp = write_sequence as usize % cap;
             let first = cap - wp;
             let first_copy = first.min(len);
 
@@ -110,7 +127,7 @@ impl SinkAsBytes for UwpSink {
                 );
             }
 
-            WRITE_POS.store((wp + len) % cap, Ordering::Release);
+            WRITE_SEQUENCE.store(write_sequence + len as u64, Ordering::Release);
         }
         super::TOTAL_WRITTEN.fetch_add(len, Ordering::SeqCst);
         Ok(())
@@ -129,10 +146,75 @@ pub extern "C" fn librespot_audio_get_capacity() -> usize {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn librespot_audio_get_write_cursor() -> usize {
-    WRITE_POS.load(Ordering::Acquire)
+    WRITE_SEQUENCE.load(Ordering::Acquire) as usize % BUFFER_SIZE
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn librespot_audio_set_read_cursor(pos: usize) {
-    READ_POS.store(pos % BUFFER_SIZE, Ordering::Release);
+    let write_sequence = WRITE_SEQUENCE.load(Ordering::Acquire);
+    let write_cursor = write_sequence as usize % BUFFER_SIZE;
+    let distance = (BUFFER_SIZE + write_cursor - (pos % BUFFER_SIZE)) % BUFFER_SIZE;
+    READ_SEQUENCE.store(
+        write_sequence.saturating_sub(distance as u64),
+        Ordering::Release,
+    );
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn librespot_audio_set_read_sequence(sequence: u64) {
+    let write_sequence = WRITE_SEQUENCE.load(Ordering::Acquire);
+    READ_SEQUENCE.store(sequence.min(write_sequence), Ordering::Release);
+}
+
+/// Returns a coherent, allocation-free snapshot for the AudioGraph quantum
+/// callback. The callback uses the generation start as a hard track boundary.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn librespot_audio_get_state(
+    generation: *mut u64,
+    generation_start_sequence: *mut u64,
+    write_sequence: *mut u64,
+) {
+    // Keep this bounded for the real-time AudioGraph callback. Publication is
+    // only three atomic operations; if it overlaps all attempts, the last
+    // snapshot is still safe because the start is stored before the generation
+    // is advanced and no PCM for that generation has been written yet.
+    for _ in 0..3 {
+        let before = STATE_VERSION.load(Ordering::Acquire);
+        let current_generation = GENERATION.load(Ordering::Acquire);
+        let current_start = GENERATION_START_SEQUENCE.load(Ordering::Acquire);
+        let current_write = WRITE_SEQUENCE.load(Ordering::Acquire);
+        let after = STATE_VERSION.load(Ordering::Acquire);
+
+        if before == after && before & 1 == 0 {
+            unsafe {
+                if !generation.is_null() {
+                    *generation = current_generation;
+                }
+                if !generation_start_sequence.is_null() {
+                    *generation_start_sequence = current_start;
+                }
+                if !write_sequence.is_null() {
+                    *write_sequence = current_write;
+                }
+            }
+            return;
+        }
+
+        std::hint::spin_loop();
+    }
+
+    let current_generation = GENERATION.load(Ordering::Acquire);
+    let current_start = GENERATION_START_SEQUENCE.load(Ordering::Acquire);
+    let current_write = WRITE_SEQUENCE.load(Ordering::Acquire);
+    unsafe {
+        if !generation.is_null() {
+            *generation = current_generation;
+        }
+        if !generation_start_sequence.is_null() {
+            *generation_start_sequence = current_start;
+        }
+        if !write_sequence.is_null() {
+            *write_sequence = current_write;
+        }
+    }
 }
