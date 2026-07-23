@@ -1,0 +1,5 @@
+[target.thumbv7a-uwp-windows-msvc]
+# windows-targets no longer ships an ARM32 MSVC umbrella import library.
+# Raw DLL imports preserve the legacy UWP target without affecting the other
+# three architectures.
+rustflags = ["--cfg", "windows_raw_dylib"]
