@@ -71,6 +71,7 @@ pub enum EventType {
     Preloading = 22,
     TimeToPreloadNextTrack = 23,
     PositionChanged = 24,
+    PlaybackKeyUnavailable = 25,
 }
 
 #[repr(C)]

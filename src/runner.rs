@@ -21,7 +21,7 @@ use librespot_metadata::{
 use librespot_playback::{
     config::{AudioFormat, PlayerConfig},
     mixer::{self, MixerConfig},
-    player::{OfflineTrackMetadata, Player, PlayerEvent},
+    player::{OfflineTrackMetadata, Player, PlayerEvent, PlayerUnavailableReason},
 };
 use librespot_protocol::{
     autoplay_context_request::AutoplayContextRequest, context::Context,
@@ -1173,6 +1173,7 @@ impl Runner {
             | PlayerEvent::Unavailable {
                 play_request_id,
                 ref track_id,
+                ..
             } => {
                 let uri = CString::new(track_id.to_string()).unwrap_or_default();
                 data.track_uri = uri.as_ptr();
@@ -1186,6 +1187,14 @@ impl Runner {
                         EventType::PlaybackStopped
                     }
                     PlayerEvent::EndOfTrack { .. } => EventType::EndOfTrack,
+                    PlayerEvent::Unavailable {
+                        reason: PlayerUnavailableReason::AudioKey,
+                        ..
+                    } => {
+                        self.state.is_playing.store(false, Ordering::Release);
+                        data.is_playing = false;
+                        EventType::PlaybackKeyUnavailable
+                    }
                     _ => EventType::PlaybackUnavailable,
                 };
 

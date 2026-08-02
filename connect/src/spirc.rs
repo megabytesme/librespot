@@ -14,7 +14,7 @@ use crate::{
     model::{LoadRequest, PlayingTrack, SpircPlayStatus},
     playback::{
         mixer::Mixer,
-        player::{Player, PlayerEvent, PlayerEventChannel},
+        player::{Player, PlayerEvent, PlayerEventChannel, PlayerUnavailableReason},
     },
     protocol::{
         connect::{Cluster, ClusterUpdate, LogoutCommand, SetVolumeCommand},
@@ -893,10 +893,21 @@ impl SpircTask {
                 self.handle_preload_next_track();
                 return Ok(());
             }
-            PlayerEvent::Unavailable { track_id, .. } => {
-                self.handle_unavailable(&track_id)?;
-                if self.connect_state.current_track(|t| &t.uri) == &track_id.to_uri() {
-                    self.handle_next(None, false)?
+            PlayerEvent::Unavailable {
+                track_id, reason, ..
+            } => {
+                if matches!(reason, PlayerUnavailableReason::AudioKey) {
+                    warn!(
+                        "Stopping playback because Spotify rejected the audio key for {track_id}"
+                    );
+                    self.player.stop();
+                    self.connect_state.update_position(0, self.now_ms());
+                    self.play_status = SpircPlayStatus::Stopped;
+                } else {
+                    self.handle_unavailable(&track_id)?;
+                    if self.connect_state.current_track(|t| &t.uri) == &track_id.to_uri() {
+                        self.handle_next(None, false)?
+                    }
                 }
             }
             _ => return Ok(()),
