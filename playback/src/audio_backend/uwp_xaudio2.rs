@@ -38,14 +38,16 @@ unsafe extern "system" {
     fn RoUninitialize();
 }
 
-// The Windows SDK umbrella import library forwards these calls to the
-// platform's UWP-safe XAudio2 implementation on all four architectures.
-#[link(name = "xaudio2")]
+// Bind XAudio2 2.8 explicitly. The generic Windows 10 SDK `xaudio2.lib`
+// imports XAudio2_9.dll, whose explicit-endpoint mastering voices fail with
+// E_NOINTERFACE on Windows 10 Mobile. XAudio2 2.8 is the inbox UWP/Phone
+// implementation and supports device-id routing on every target architecture.
+#[link(name = "xaudio2_8")]
 unsafe extern "system" {
     fn XAudio2Create(engine: *mut *mut c_void, flags: u32, processor: u32) -> HResult;
 }
 
-#[link(name = "xaudio2")]
+#[link(name = "xaudio2_8")]
 unsafe extern "C" {
     fn CreateFX(
         class_id: *const Guid,
