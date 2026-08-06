@@ -38,10 +38,11 @@ unsafe extern "system" {
     fn RoUninitialize();
 }
 
-// Bind XAudio2 2.8 explicitly. The generic Windows 10 SDK `xaudio2.lib`
-// imports XAudio2_9.dll, whose explicit-endpoint mastering voices fail with
-// E_NOINTERFACE on Windows 10 Mobile. XAudio2 2.8 is the inbox UWP/Phone
-// implementation and supports device-id routing on every target architecture.
+// Bind XAudio2 2.8 explicitly. It is the inbox UWP/Phone implementation and
+// works for the platform's default/virtual audio client. Windows 10 Mobile can
+// still reject explicit endpoint mastering voices with E_NOINTERFACE; uwp.rs
+// handles that platform limitation with the Rust-effects/WASAPI compatibility
+// renderer after this constructor reports the failure.
 #[link(name = "xaudio2_8")]
 unsafe extern "system" {
     fn XAudio2Create(engine: *mut *mut c_void, flags: u32, processor: u32) -> HResult;

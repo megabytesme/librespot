@@ -15,10 +15,13 @@ mod wasapi;
 mod windows_native;
 #[path = "uwp_xaudio2.rs"]
 mod xaudio2;
+#[path = "uwp_xaudio2_endpoint.rs"]
+mod xaudio2_endpoint;
 
 use ring::RingBufferSink;
 use wasapi::WasapiSink;
 use xaudio2::XAudio2Sink;
+use xaudio2_endpoint::XAudio2EndpointSink;
 
 const SAMPLE_RATE: u32 = 44_100;
 const CHANNELS: u16 = 2;
@@ -147,6 +150,7 @@ enum ActiveSink {
     Ring(RingBufferSink),
     Wasapi(WasapiSink),
     XAudio2(XAudio2Sink),
+    XAudio2Endpoint(XAudio2EndpointSink),
 }
 
 impl ActiveSink {
@@ -156,6 +160,7 @@ impl ActiveSink {
             Self::Ring(sink) => sink.start(),
             Self::Wasapi(sink) => sink.start(),
             Self::XAudio2(sink) => sink.start(),
+            Self::XAudio2Endpoint(sink) => sink.start(),
         }
     }
 
@@ -165,6 +170,7 @@ impl ActiveSink {
             Self::Ring(sink) => sink.stop(),
             Self::Wasapi(sink) => sink.stop(),
             Self::XAudio2(sink) => sink.stop(),
+            Self::XAudio2Endpoint(sink) => sink.stop(),
         }
     }
 }
@@ -193,32 +199,38 @@ impl UwpSink {
             WindowsAudioBackend::Wasapi => {
                 WasapiSink::new(SAMPLE_RATE, CHANNELS, device).map(ActiveSink::Wasapi)
             }
-            WindowsAudioBackend::XAudio2 => {
-                XAudio2Sink::new(SAMPLE_RATE, CHANNELS, device).map(ActiveSink::XAudio2)
-            }
+            WindowsAudioBackend::XAudio2 => match XAudio2Sink::new(SAMPLE_RATE, CHANNELS, device) {
+                Ok(sink) => Ok(ActiveSink::XAudio2(sink)),
+                Err(xaudio_error) if !device.is_empty() => {
+                    log::warn!(
+                        "XAudio2 rejected explicit endpoint {device:?} ({xaudio_error}); using the Rust effects compatibility renderer with native WASAPI endpoint transport"
+                    );
+                    XAudio2EndpointSink::new(SAMPLE_RATE, CHANNELS, device)
+                            .map(ActiveSink::XAudio2Endpoint)
+                            .map_err(|wasapi_error| {
+                                SinkError::NotConnected(format!(
+                                    "XAudio2 endpoint failed ({xaudio_error}); compatibility endpoint failed ({wasapi_error})"
+                                ))
+                            })
+                }
+                Err(error) => Err(error),
+            },
         }
     }
 
     fn probe(backend: WindowsAudioBackend, device: &str) -> SinkResult<()> {
-        match backend {
-            WindowsAudioBackend::RingBuffer => {
-                if ring::ensure_buffer_allocated() {
-                    Ok(())
-                } else {
-                    Err(SinkError::NotConnected(
-                        "unable to allocate the managed ring buffer".into(),
-                    ))
-                }
-            }
-            WindowsAudioBackend::Wasapi => {
-                drop(WasapiSink::new(SAMPLE_RATE, CHANNELS, device)?);
+        if backend == WindowsAudioBackend::RingBuffer {
+            return if ring::ensure_buffer_allocated() {
                 Ok(())
-            }
-            WindowsAudioBackend::XAudio2 => {
-                drop(XAudio2Sink::new(SAMPLE_RATE, CHANNELS, device)?);
-                Ok(())
-            }
+            } else {
+                Err(SinkError::NotConnected(
+                    "unable to allocate the managed ring buffer".into(),
+                ))
+            };
         }
+
+        drop(Self::create_active(AudioFormat::F32, backend, device)?);
+        Ok(())
     }
 
     fn ensure_selected(&mut self) -> SinkResult<()> {
@@ -305,6 +317,10 @@ impl Sink for UwpSink {
                 let _ = sink.flush();
                 NATIVE_GENERATION.fetch_add(1, Ordering::AcqRel) + 1
             }
+            ActiveSink::XAudio2Endpoint(sink) => {
+                let _ = sink.flush();
+                NATIVE_GENERATION.fetch_add(1, Ordering::AcqRel) + 1
+            }
             ActiveSink::None => NATIVE_GENERATION.fetch_add(1, Ordering::AcqRel) + 1,
         }
     }
@@ -324,6 +340,7 @@ impl Sink for UwpSink {
             ActiveSink::Ring(sink) => sink.start(),
             ActiveSink::Wasapi(sink) => sink.start(),
             ActiveSink::XAudio2(sink) => sink.start(),
+            ActiveSink::XAudio2Endpoint(sink) => sink.start(),
         };
         if result.is_ok() {
             self.running = true;
@@ -348,6 +365,7 @@ impl Sink for UwpSink {
         match &mut self.active {
             ActiveSink::Wasapi(sink) => sink.write_f32(&samples)?,
             ActiveSink::XAudio2(sink) => sink.write_f32(&samples)?,
+            ActiveSink::XAudio2Endpoint(sink) => sink.write_f32(&samples)?,
             ActiveSink::None | ActiveSink::Ring(_) => {
                 return Err(SinkError::NotConnected(
                     "native Windows audio backend was not initialized".into(),
