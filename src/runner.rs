@@ -8,7 +8,7 @@ use librespot_connect::{
 };
 use librespot_core::{
     FileId, Session, SessionConfig, SpotifyId, SpotifyUri, authentication::Credentials,
-    cache::Cache, config::DeviceType,
+    cache::Cache, config::DeviceType, error::ErrorKind as CoreErrorKind,
 };
 use librespot_discovery::Discovery;
 use librespot_metadata::audio::{AudioFileFormat, AudioItem};
@@ -24,8 +24,8 @@ use librespot_playback::{
     player::{OfflineTrackMetadata, Player, PlayerEvent, PlayerUnavailableReason},
 };
 use librespot_protocol::{
-    autoplay_context_request::AutoplayContextRequest, context::Context,
-    playlist4_external::SelectedListContent,
+    authentication::AuthenticationType, autoplay_context_request::AutoplayContextRequest,
+    context::Context, playlist4_external::SelectedListContent,
 };
 use protobuf::Message;
 use serde::{Deserialize, Serialize};
@@ -363,6 +363,7 @@ pub struct RunnerState {
     pub sample_rate: AtomicU32,
     pub bytes_per_sample: AtomicU8,
     pub audio_generation: AtomicU64,
+    pub playback_credentials: RwLock<Option<String>>,
 }
 
 impl RunnerState {
@@ -388,6 +389,7 @@ impl RunnerState {
             sample_rate: AtomicU32::new(sample_rate),
             bytes_per_sample: AtomicU8::new(bytes),
             audio_generation: AtomicU64::new(0),
+            playback_credentials: RwLock::new(None),
         }
     }
 }
@@ -834,17 +836,47 @@ impl Runner {
 
                         match spirc_res {
                             Ok((s, task)) => {
+                                let credentials = Credentials {
+                                    username: Some(session.username().to_owned()),
+                                    auth_type: AuthenticationType::AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS,
+                                    auth_data: session.auth_data(),
+                                };
+                                match serde_json::to_string(&credentials) {
+                                    Ok(json) => {
+                                        if let Ok(mut slot) = self.state.playback_credentials.write() {
+                                            *slot = Some(json);
+                                        }
+                                    }
+                                    Err(err) => log::error!(
+                                        "Unable to retain reusable playback credentials: {err}"
+                                    ),
+                                }
                                 spirc = Some(s);
                                 spirc_task = Some(Box::pin(task));
                                 connect_backoff = Duration::from_secs(1);
                                 next_connect_attempt = Instant::now();
+                                let session_user = CString::new(session.username()).unwrap_or_default();
+                                let mut data: EventData = unsafe { std::mem::zeroed() };
+                                data.session_user = session_user.as_ptr();
                                 self.emit(LibrespotEvent {
                                     event_type: EventType::SessionConnected,
-                                    data: unsafe { std::mem::zeroed() }
+                                    data,
                                 });
                                 connecting = false;
                             }
                             Err(e) => {
+                                if e.kind == CoreErrorKind::Unauthenticated {
+                                    log::error!(
+                                        "Spotify rejected the playback authorization; waiting for new credentials"
+                                    );
+                                    self.emit(LibrespotEvent {
+                                        event_type: EventType::PlaybackAuthorizationRejected,
+                                        data: unsafe { std::mem::zeroed() }
+                                    });
+                                    connecting = false;
+                                    last_creds = None;
+                                    continue;
+                                }
                                 log::error!(
                                     "Spirc connection failed: {:?}. Retrying in {:?}.",
                                     e,

@@ -125,7 +125,7 @@ pub unsafe extern "C" fn librespot_new(
     };
 
     let cache = match Cache::new(
-        Some(setup.cache_dir.clone()),
+        None::<std::path::PathBuf>,
         Some(setup.cache_dir.clone()),
         Some(setup.cache_dir.join("audio")),
         Some(setup.persisted_cache_dir.join("audio")),
@@ -403,6 +403,40 @@ pub unsafe extern "C" fn librespot_last_error_get() -> *mut c_char {
 pub unsafe extern "C" fn librespot_string_free(value: *mut c_char) {
     if !value.is_null() {
         let _ = unsafe { CString::from_raw(value) };
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn librespot_get_playback_credentials(
+    instance: *mut LibrespotInstance,
+) -> *mut c_char {
+    let Some(instance) = (unsafe { instance.as_ref() }) else {
+        set_last_error("instance pointer was null");
+        return std::ptr::null_mut();
+    };
+
+    let credentials = instance
+        .state
+        .playback_credentials
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone());
+    let Some(credentials) = credentials else {
+        set_last_error("reusable playback credentials are not available yet");
+        return std::ptr::null_mut();
+    };
+
+    match CString::new(credentials) {
+        Ok(value) => {
+            clear_last_error();
+            value.into_raw()
+        }
+        Err(err) => {
+            set_last_error(format!(
+                "playback credentials contained invalid data: {err}"
+            ));
+            std::ptr::null_mut()
+        }
     }
 }
 

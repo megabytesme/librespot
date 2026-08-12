@@ -46,6 +46,9 @@ enum Login5Error {
 impl From<Login5Error> for Error {
     fn from(err: Login5Error) -> Self {
         match err {
+            Login5Error::FaultyRequest(LoginError::INVALID_CREDENTIALS) => {
+                Error::unauthenticated(err)
+            }
             Login5Error::NoStoredCredentials | Login5Error::OnlyForMobile => {
                 Error::unavailable(err)
             }
