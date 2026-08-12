@@ -74,6 +74,7 @@ pub enum EventType {
     PositionChanged = 24,
     PlaybackKeyUnavailable = 25,
     PlaybackAuthorizationRejected = 26,
+    PlaybackAccountUnsupported = 27,
 }
 
 #[repr(C)]

@@ -3,7 +3,6 @@ use std::{
     future::Future,
     io,
     pin::Pin,
-    process::exit,
     sync::{Arc, OnceLock, RwLock, Weak},
     task::{Context, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -366,11 +365,22 @@ impl Session {
             if account_type != "premium" {
                 error!("librespot does not support {account_type:?} accounts.");
                 info!("Please support Spotify and your artists and sign up for a premium account.");
-
-                // TODO: logout instead of exiting
-                exit(1);
             }
         }
+    }
+
+    /// Clears the last product type before a new authentication attempt.
+    ///
+    /// Embedded clients must be able to observe and reject an unsupported
+    /// account without inheriting the previous session's product metadata.
+    pub fn clear_account_type(&self) {
+        self.0
+            .data
+            .write()
+            .expect(SESSION_DATA_POISON_MSG)
+            .user_data
+            .attributes
+            .remove("type");
     }
 
     pub fn send_packet(&self, cmd: PacketType, data: Vec<u8>) -> Result<(), Error> {

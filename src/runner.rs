@@ -580,6 +580,7 @@ impl Runner {
         let mut connecting = last_creds.is_some();
         let mut next_connect_attempt = Instant::now();
         let mut connect_backoff = Duration::from_secs(1);
+        let mut account_validation_pending = false;
 
         loop {
             tokio::select! {
@@ -699,6 +700,7 @@ impl Runner {
                             log::info!("Updating credentials: User {}", username);
                             last_creds = Some(Credentials::with_password(username, auth_data));
                             connecting = true;
+                            account_validation_pending = false;
                             if let Some(s) = spirc.take() { let _ = s.shutdown(); }
                             spirc_task = None;
                         }
@@ -826,6 +828,7 @@ impl Runner {
 
                     if let Some(c) = last_creds.clone() {
                         if let Some(s) = spirc.take() { let _ = s.shutdown(); }
+                        session.clear_account_type();
                         let spirc_res = Spirc::new(
                             self.setup.connect_config.clone(),
                             session.clone(),
@@ -862,6 +865,7 @@ impl Runner {
                                     event_type: EventType::SessionConnected,
                                     data,
                                 });
+                                account_validation_pending = true;
                                 connecting = false;
                             }
                             Err(e) => {
@@ -888,6 +892,34 @@ impl Runner {
                                     Duration::from_secs(30),
                                 );
                             }
+                        }
+                    }
+                }
+
+                _ = sleep(Duration::from_millis(100)), if account_validation_pending => {
+                    if let Some(account_type) = session.get_user_attribute("type") {
+                        account_validation_pending = false;
+                        if account_type != "premium" {
+                            log::error!(
+                                "Spotify playback account type {:?} is unsupported; disconnecting without terminating the host process",
+                                account_type
+                            );
+                            player.stop();
+                            if let Some(s) = spirc.take() {
+                                let _ = s.shutdown();
+                            }
+                            spirc_task = None;
+                            connecting = false;
+                            last_creds = None;
+                            session.shutdown();
+                            self.emit(LibrespotEvent {
+                                event_type: EventType::PlaybackAccountUnsupported,
+                                data: unsafe { std::mem::zeroed() },
+                            });
+                            self.emit(LibrespotEvent {
+                                event_type: EventType::SessionDisconnected,
+                                data: unsafe { std::mem::zeroed() },
+                            });
                         }
                     }
                 }
