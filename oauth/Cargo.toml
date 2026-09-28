@@ -42,6 +42,9 @@ thiserror = "2"
 tokio = { version = "1", features = ["time"] }
 url = "2.5"
 
+[target.'cfg(not(target_vendor = "uwp"))'.dependencies]
+open = "5"
+
 [dev-dependencies]
 env_logger = { version = "0.11", default-features = false, features = [
     "color",

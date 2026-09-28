@@ -217,10 +217,15 @@ pub enum PlayerEvent {
         play_request_id: u64,
         position_ms: u32,
         active: bool,
+        duration_ms: u32,
+        text: String,
     },
     // Play request id changed
     PlayRequestIdChanged {
         play_request_id: u64,
+    },
+    AddedToQueue {
+        track_id: SpotifyUri,
     },
     // Fired when the player is stopped (e.g. by issuing a "stop" command to the player).
     Stopped {
@@ -794,6 +799,10 @@ impl Player {
 
     pub fn emit_auto_play_changed_event(&self, auto_play: bool) {
         self.command(PlayerCommand::EmitAutoPlayChangedEvent(auto_play));
+    }
+
+    pub fn emit_added_to_queue_event(&self, track_id: SpotifyUri) {
+        self.command(PlayerCommand::EmitAddedToQueueEvent(track_id));
     }
 
     pub fn emit_set_queue_event(
@@ -1768,7 +1777,7 @@ impl Future for PlayerInternal {
                                 .unwrap_or(normalisation_factor);
                             let narration_changed = narrating != was_narrating;
                             if narration_changed {
-                                *reported_nominal_start_time = None;
+                                reported_position.reset(*stream_position_ms, Instant::now());
                             }
                             let narration_event =
                                 narration_changed.then(|| PlayerEvent::Narration {
@@ -1780,6 +1789,16 @@ impl Future for PlayerInternal {
                                             position.position_ms
                                         }),
                                     active: narrating,
+                                    duration_ms: if narrating {
+                                        decoder.narration_duration_ms().unwrap_or_default()
+                                    } else {
+                                        0
+                                    },
+                                    text: if narrating {
+                                        decoder.narration_text().unwrap_or_default().to_owned()
+                                    } else {
+                                        String::new()
+                                    },
                                 });
                             if let Some((ref packet_position, ref packet)) = result {
                                 let new_stream_position_ms = packet_position.position_ms;
@@ -2707,6 +2726,10 @@ impl PlayerInternal {
                 self.send_event(PlayerEvent::AutoPlayChanged { auto_play })
             }
 
+            PlayerCommand::EmitAddedToQueueEvent(track_id) => {
+                self.send_event(PlayerEvent::AddedToQueue { track_id })
+            }
+
             PlayerCommand::EmitSessionClientChangedEvent {
                 client_id,
                 client_name,
@@ -2797,7 +2820,8 @@ impl PlayerInternal {
         spotify_uri: SpotifyUri,
         position_ms: u32,
         narration: Narration,
-    ) -> impl FusedFuture<Output = Result<PlayerLoadedTrackData, PlayerUnavailableReason>> + Send + 'static {
+    ) -> impl FusedFuture<Output = Result<PlayerLoadedTrackData, PlayerUnavailableReason>> + Send + 'static
+    {
         // This method creates a future that returns the loaded stream and associated info.
         // Ideally all work should be done using asynchronous code. However, seek() on the
         // audio stream is implemented in a blocking fashion. Thus, we can't turn it into future
@@ -3030,6 +3054,10 @@ impl fmt::Debug for PlayerCommand {
             PlayerCommand::EmitAutoPlayChangedEvent(auto_play) => f
                 .debug_tuple("EmitAutoPlayChangedEvent")
                 .field(&auto_play)
+                .finish(),
+            PlayerCommand::EmitAddedToQueueEvent(track_id) => f
+                .debug_tuple("EmitAddedToQueueEvent")
+                .field(&track_id)
                 .finish(),
             PlayerCommand::EmitSetQueueEvent {
                 context_uri,

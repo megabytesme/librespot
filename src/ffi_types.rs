@@ -107,6 +107,8 @@ pub struct EventData {
     pub audio_generation: u64,
     pub was_preloaded: bool,
     pub is_narrating: bool,
+    pub narration_duration_ms: u32,
+    pub narration_text: *const c_char,
 }
 
 #[repr(C)]

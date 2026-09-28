@@ -85,6 +85,13 @@ pub trait AudioDecoder {
     fn normalisation_override(&self) -> Option<f64> {
         None
     }
+    /// Duration and readable text for the auxiliary speech packet currently exposed.
+    fn narration_duration_ms(&self) -> Option<u32> {
+        None
+    }
+    fn narration_text(&self) -> Option<&str> {
+        None
+    }
 }
 
 impl From<DecoderError> for librespot_core::error::Error {

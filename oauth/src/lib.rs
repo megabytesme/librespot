@@ -614,7 +614,10 @@ impl DeviceAuthClient {
     fn announce(&self, auth: &DeviceAuthorization) {
         let url = auth.url();
         if self.should_open_url {
+            #[cfg(not(target_vendor = "uwp"))]
             open::that_in_background(url);
+            #[cfg(target_vendor = "uwp")]
+            log::info!("Please open this URL manually: {url}");
         }
         println!("Browse to: {url}");
         println!("If prompted, enter code: {}", auth.user_code());

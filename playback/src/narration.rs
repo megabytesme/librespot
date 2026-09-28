@@ -24,6 +24,7 @@ type Decoder = Box<dyn AudioDecoder + Send>;
 #[derive(Clone, PartialEq)]
 struct Script {
     request: TtsRequest,
+    text: String,
     loudness: f64,
     peak: f64,
 }
@@ -84,6 +85,7 @@ impl Script {
     fn parse(metadata: &HashMap<String, String>, prefix: &str) -> Option<Self> {
         let get = |key| metadata.get(&format!("{prefix}.{key}")).map(String::as_str);
         let ssml = get("ssml").filter(|text| !text.trim().is_empty() && text.len() <= 64 * 1024)?;
+        let text = plain_text_from_ssml(ssml);
         let mut request = TtsRequest {
             audio_format: AudioFormat::MP3.into(),
             tts_voice: get("voice")
@@ -104,16 +106,70 @@ impl Script {
         };
         Some(Self {
             request,
+            text,
             loudness: level("loudness", -16.0),
             peak: level("true_peak", -3.0),
         })
     }
 }
 
+fn plain_text_from_ssml(ssml: &str) -> String {
+    let mut in_tag = false;
+    let mut body = String::with_capacity(ssml.len());
+    for character in ssml.chars() {
+        match character {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => body.push(character),
+            _ => {}
+        }
+    }
+
+    let mut decoded = String::with_capacity(body.len());
+    let mut remaining = body.as_str();
+    while let Some(start) = remaining.find('&') {
+        decoded.push_str(&remaining[..start]);
+        let entity_start = start + 1;
+        let Some(end) = remaining[entity_start..].find(';') else {
+            decoded.push_str(&remaining[start..]);
+            remaining = "";
+            break;
+        };
+        let entity_end = entity_start + end;
+        let entity = &remaining[entity_start..entity_end];
+        let value = match entity {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            value if value.starts_with("#x") || value.starts_with("#X") => {
+                u32::from_str_radix(&value[2..], 16)
+                    .ok()
+                    .and_then(char::from_u32)
+            }
+            value if value.starts_with('#') => {
+                value[1..].parse::<u32>().ok().and_then(char::from_u32)
+            }
+            _ => None,
+        };
+        if let Some(value) = value {
+            decoded.push(value);
+        } else {
+            decoded.push_str(&remaining[start..=entity_end]);
+        }
+        remaining = &remaining[entity_end + 1..];
+    }
+    decoded.push_str(remaining);
+    decoded.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 struct Speech {
     decoder: Decoder,
     gain: f64,
     remaining_samples: usize,
+    duration_ms: u32,
+    text: String,
 }
 
 impl Speech {
@@ -131,6 +187,7 @@ impl Speech {
             let mut hint = Hint::new();
             hint.with_extension("mp3");
             let decoder = SymphoniaDecoder::new_narration(Cursor::new(bytes), hint)?;
+            let duration_ms = decoder.duration_ms().unwrap_or_default();
             let gain_db = -14.0 - script.loudness;
             let peak = 10.0_f64.powf(script.peak / 20.0);
             let gain = NormalisationData::get_factor(
@@ -146,6 +203,8 @@ impl Speech {
                 decoder: Box::new(decoder),
                 gain,
                 remaining_samples: SAMPLES_PER_SECOND as usize * 120,
+                duration_ms,
+                text: script.text,
             })
         };
         match tokio::time::timeout(Duration::from_secs(8), operation).await {
@@ -202,6 +261,17 @@ impl NarratedDecoder {
             packet_gain: None,
         }
     }
+
+    fn current_speech(&self) -> Option<&Speech> {
+        if self.packet_gain.is_none() {
+            return None;
+        }
+        match self.phase {
+            Phase::Before => self.before.as_ref(),
+            Phase::After => self.after.as_ref(),
+            Phase::Song | Phase::End => None,
+        }
+    }
 }
 
 impl AudioDecoder for NarratedDecoder {
@@ -250,6 +320,12 @@ impl AudioDecoder for NarratedDecoder {
     fn normalisation_override(&self) -> Option<f64> {
         self.packet_gain
     }
+    fn narration_duration_ms(&self) -> Option<u32> {
+        self.current_speech().map(|speech| speech.duration_ms)
+    }
+    fn narration_text(&self) -> Option<&str> {
+        self.current_speech().map(|speech| speech.text.as_str())
+    }
 }
 
 #[cfg(test)]
@@ -281,6 +357,8 @@ mod tests {
             decoder: decoder(value, 999),
             gain: 0.5,
             remaining_samples: 32,
+            duration_ms: 1200,
+            text: "sample narration".into(),
         })
     }
     fn next(decoder: &mut NarratedDecoder) -> (u32, f64, bool) {
@@ -322,6 +400,8 @@ mod tests {
             decoder: broken(),
             gain: 1.0,
             remaining_samples: 32,
+            duration_ms: 1000,
+            text: "intro".into(),
         };
         let mut narrated = NarratedDecoder::new(decoder(0.2, 0), Some(before), None, 100);
         assert_eq!(next(&mut narrated), (0, 0.2, false));
@@ -350,5 +430,26 @@ mod tests {
             ("narration.intro.voice".into(), "UNSUPPORTED_VOICE".into()),
         ]);
         assert!(Narration::from_metadata(&metadata, false, 0) == Narration::default());
+    }
+
+    #[test]
+    fn ssml_is_converted_to_readable_narration_text() {
+        assert_eq!(
+            plain_text_from_ssml(
+                "<speak>Hello <emphasis>world</emphasis> &amp; friends &#x1F3B5;</speak>"
+            ),
+            "Hello world & friends 🎵"
+        );
+    }
+
+    #[test]
+    fn narration_metadata_is_available_for_the_active_speech() {
+        let mut decoder = NarratedDecoder::new(decoder(0.2, 0), speech(0.1), None, 100);
+        assert_eq!(next(&mut decoder), (0, 0.1, true));
+        assert_eq!(decoder.narration_duration_ms(), Some(1200));
+        assert_eq!(decoder.narration_text(), Some("sample narration"));
+        assert_eq!(next(&mut decoder), (0, 0.2, false));
+        assert_eq!(decoder.narration_duration_ms(), None);
+        assert_eq!(decoder.narration_text(), None);
     }
 }

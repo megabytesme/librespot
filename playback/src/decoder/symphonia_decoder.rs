@@ -136,6 +136,16 @@ impl SymphoniaDecoder {
         }
     }
 
+    pub(crate) fn duration_ms(&self) -> Option<u32> {
+        let codec_params = self.decoder.codec_params();
+        let (time_base, n_frames) = (codec_params.time_base?, codec_params.n_frames?);
+        Some(
+            Duration::from(time_base.calc_time(n_frames))
+                .as_millis()
+                .min(u32::MAX as u128) as u32,
+        )
+    }
+
     pub(crate) fn local_file_metadata(&mut self) -> Option<LocalFileMetadata> {
         let metadata = symphonia_util::get_latest_metadata(&mut self.probe_result)?;
         let tags = metadata.current()?.tags();

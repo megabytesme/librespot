@@ -1276,21 +1276,29 @@ impl Runner {
                 play_request_id,
                 ref track_id,
                 active,
+                duration_ms,
+                ref text,
                 ..
             } => {
                 let uri = CString::new(track_id.to_string()).unwrap_or_default();
+                let text = CString::new(text.as_str()).unwrap_or_default();
                 data.track_uri = uri.as_ptr();
                 data.play_request_id = play_request_id;
                 data.is_narrating = active;
+                data.narration_duration_ms = duration_ms;
+                data.narration_text = text.as_ptr();
                 temp_strings.push(uri);
+                temp_strings.push(text);
 
                 self.emit(LibrespotEvent {
                     event_type: EventType::NarrationChanged,
                     data,
                 });
             }
-            PlayerEvent::DjStateChanged { .. } | PlayerEvent::DjJumpRejected => {
-                // DJ set state is handled by Connect and is not exposed to the UWP host.
+            PlayerEvent::SetQueue { .. }
+            | PlayerEvent::DjStateChanged { .. }
+            | PlayerEvent::DjJumpRejected => {
+                // Queue snapshots and DJ set state are not exposed to the UWP host.
             }
         }
     }
