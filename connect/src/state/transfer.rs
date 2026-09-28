@@ -44,6 +44,13 @@ impl ConnectState {
         transfer: &mut TransferState,
         ctx_uri: Option<String>,
     ) {
+        let dj_url = transfer
+            .current_session
+            .context
+            .url
+            .as_ref()
+            .filter(|url| url.starts_with("hm://lexicon-session-provider/"))
+            .cloned();
         let current_context_metadata = self.context.as_ref().map(|c| c.metadata.clone());
         let player = self.player_mut();
 
@@ -95,7 +102,7 @@ impl ConnectState {
         // so that the player doesn't go into an inactive state
         let uri = ctx_uri.unwrap_or(UNKNOWN_URI.into());
 
-        player.context_url = format!("context://{uri}");
+        player.context_url = dj_url.unwrap_or_else(|| format!("context://{uri}"));
         player.context_uri = uri;
 
         if let Some(metadata) = current_context_metadata {
@@ -104,8 +111,9 @@ impl ConnectState {
             }
         }
 
+        self.set_shuffle(self.shuffling_context());
         self.transfer_shuffle = match (shuffle_seed, initial_track) {
-            (Some(seed), Some(initial_track)) => Some(ShuffleState {
+            (Some(seed), Some(initial_track)) if !self.is_dj() => Some(ShuffleState {
                 seed,
                 initial_track,
             }),
@@ -138,7 +146,8 @@ impl ConnectState {
         let current_index = match transfer.current_session.current_uid.as_ref() {
             Some(uid) if track.is_queue() => Self::find_index_in_context(ctx, |c| &c.uid == uid)
                 .map(|i| if i > 0 { i - 1 } else { i }),
-            _ => Self::find_index_in_context(ctx, |c| c.uri == track.uri || c.uid == track.uid),
+            _ => Self::find_index_in_context(ctx, |c| !track.uid.is_empty() && c.uid == track.uid)
+                .or_else(|_| Self::find_index_in_context(ctx, |c| c.uri == track.uri)),
         };
 
         debug!(
@@ -154,6 +163,14 @@ impl ConnectState {
 
         let current_index = current_index.ok();
         if let Some(current_index) = current_index {
+            // Transferred tracks can be skeletal. Keep narration and other
+            // per-track data supplied by the resolved session.
+            let metadata = self.get_context(context_ty)?.tracks[current_index]
+                .metadata
+                .clone();
+            if let Some(track) = self.player_mut().track.as_mut() {
+                track.metadata.extend(metadata);
+            }
             self.update_current_index(|i| i.track = current_index as u32);
         }
 

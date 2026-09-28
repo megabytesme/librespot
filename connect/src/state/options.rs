@@ -38,6 +38,8 @@ impl ConnectState {
     }
 
     pub fn set_shuffle(&mut self, shuffle: bool) {
+        // DJ supplies ordered sets and narration for their boundaries.
+        let shuffle = shuffle && !self.is_dj();
         self.add_options_if_empty();
         if let Some(options) = self.player_mut().options.as_mut() {
             options.shuffling_context = shuffle;

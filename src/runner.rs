@@ -1143,6 +1143,26 @@ impl Runner {
                     data,
                 });
             }
+            PlayerEvent::Narration {
+                play_request_id,
+                ref track_id,
+                active,
+                ..
+            } => {
+                let uri = CString::new(track_id.to_string()).unwrap_or_default();
+                data.track_uri = uri.as_ptr();
+                data.play_request_id = play_request_id;
+                data.is_narrating = active;
+                temp_strings.push(uri);
+
+                self.emit(LibrespotEvent {
+                    event_type: EventType::NarrationChanged,
+                    data,
+                });
+            }
+            PlayerEvent::DjStateChanged { .. } | PlayerEvent::DjJumpRejected => {
+                // DJ set state is handled by Connect and is not exposed to the UWP host.
+            }
         }
     }
 

@@ -18,6 +18,7 @@ pub struct SymphoniaDecoder {
     probe_result: ProbeResult,
     decoder: Box<dyn Decoder>,
     sample_buffer: Option<SampleBuffer<f64>>,
+    duplicate_mono: bool,
 }
 
 #[derive(Default)]
@@ -33,6 +34,22 @@ pub(crate) struct LocalFileMetadata {
 
 impl SymphoniaDecoder {
     pub fn new<R>(input: R, hint: Hint) -> DecoderResult<Self>
+    where
+        R: MediaSource + 'static,
+    {
+        Self::with_mono(input, hint, false)
+    }
+
+    /// Speech may arrive as mono MP3 even when its requested sample rate is
+    /// 44.1 kHz. Duplicate each mono sample, without changing speed or level.
+    pub fn new_narration<R>(input: R, hint: Hint) -> DecoderResult<Self>
+    where
+        R: MediaSource + 'static,
+    {
+        Self::with_mono(input, hint, true)
+    }
+
+    fn with_mono<R>(input: R, hint: Hint, allow_mono: bool) -> DecoderResult<Self>
     where
         R: MediaSource + 'static,
     {
@@ -77,7 +94,8 @@ impl SymphoniaDecoder {
         let channels = decoder.codec_params().channels.ok_or_else(|| {
             DecoderError::SymphoniaDecoder("Could not retrieve channel configuration".into())
         })?;
-        if channels.count() != NUM_CHANNELS as usize {
+        let duplicate_mono = allow_mono && channels.count() == 1;
+        if channels.count() != NUM_CHANNELS as usize && !duplicate_mono {
             return Err(DecoderError::SymphoniaDecoder(format!(
                 "Unsupported number of channels: {channels}"
             )));
@@ -89,6 +107,7 @@ impl SymphoniaDecoder {
             // We set the sample buffer when decoding the first full packet,
             // whose duration is also the ideal sample buffer size.
             sample_buffer: None,
+            duplicate_mono,
         })
     }
 
@@ -253,7 +272,10 @@ impl AudioDecoder for SymphoniaDecoder {
                     };
 
                     sample_buffer.copy_interleaved_ref(decoded);
-                    let samples = AudioPacket::Samples(sample_buffer.samples().to_vec());
+                    let samples = AudioPacket::Samples(output_samples(
+                        sample_buffer.samples(),
+                        self.duplicate_mono,
+                    ));
 
                     return Ok(Some((packet_position, samples)));
                 }
@@ -267,5 +289,32 @@ impl AudioDecoder for SymphoniaDecoder {
                 Err(err) => return Err(err.into()),
             }
         }
+    }
+}
+
+fn output_samples(samples: &[f64], duplicate_mono: bool) -> Vec<f64> {
+    if duplicate_mono {
+        samples
+            .iter()
+            .flat_map(|&sample| [sample, sample])
+            .collect()
+    } else {
+        samples.to_vec()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::output_samples;
+
+    #[test]
+    fn mono_speech_keeps_amplitude_and_frame_count_in_stereo() {
+        assert_eq!(
+            output_samples(&[0.25, -0.5, 0.0], true),
+            vec![0.25, 0.25, -0.5, -0.5, 0.0, 0.0]
+        );
+        let stereo = [0.25, -0.5, 0.0, 0.75];
+        assert_eq!(output_samples(&stereo, false), stereo);
+        assert!(output_samples(&[], true).is_empty());
     }
 }

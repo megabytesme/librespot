@@ -11,6 +11,29 @@ use std::ffi::CStr;
 use std::path::PathBuf;
 use std::str::FromStr;
 
+fn parse_stored_credentials_json(json: &str) -> Result<Credentials, String> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|_| "FFI: Invalid stored credentials JSON".to_string())?;
+
+    if value.get("auth_type").and_then(serde_json::Value::as_i64) != Some(1) {
+        return Err("FFI: Playback credentials must use stored Spotify credentials".to_string());
+    }
+
+    let credentials: Credentials = serde_json::from_value(value)
+        .map_err(|_| "FFI: Invalid stored credentials JSON".to_string())?;
+
+    if credentials
+        .username
+        .as_deref()
+        .is_none_or(|username| username.is_empty())
+        || credentials.auth_data.is_empty()
+    {
+        return Err("FFI: Stored credentials are incomplete".to_string());
+    }
+
+    Ok(credentials)
+}
+
 pub fn parse_ffi_config(c_cfg: &LibrespotConfig) -> Result<RunnerSetup, String> {
     unsafe {
         if c_cfg.device_name.is_null()
@@ -50,7 +73,11 @@ pub fn parse_ffi_config(c_cfg: &LibrespotConfig) -> Result<RunnerSetup, String> 
         let cache_dir = PathBuf::from(cache_path.as_ref());
         let persisted_cache_dir = PathBuf::from(persisted_cache_path.as_ref());
 
-        let initial_creds = if !c_cfg.access_token.is_null() {
+        let initial_creds = if !c_cfg.auth_blob.is_null() {
+            let credentials_json = CStr::from_ptr(c_cfg.auth_blob).to_string_lossy();
+            log::info!("FFI: Authenticating via stored Spotify credentials");
+            Some(parse_stored_credentials_json(&credentials_json)?)
+        } else if !c_cfg.access_token.is_null() {
             let token = CStr::from_ptr(c_cfg.access_token)
                 .to_string_lossy()
                 .into_owned();
@@ -125,5 +152,30 @@ pub fn parse_ffi_config(c_cfg: &LibrespotConfig) -> Result<RunnerSetup, String> 
             cache_dir,
             persisted_cache_dir,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_stored_credentials_json;
+
+    #[test]
+    fn parses_serialized_stored_spotify_credentials() {
+        let credentials = parse_stored_credentials_json(
+            r#"{"username":"test-user","auth_type":1,"auth_data":"ZmFrZS1hdXRoLWRhdGE="}"#,
+        )
+        .expect("stored credentials should parse");
+
+        assert_eq!(credentials.username.as_deref(), Some("test-user"));
+        assert_eq!(credentials.auth_data, b"fake-auth-data");
+    }
+
+    #[test]
+    fn rejects_non_stored_credentials_auth_types() {
+        let result = parse_stored_credentials_json(
+            r#"{"username":"test-user","auth_type":3,"auth_data":"dG9rZW4="}"#,
+        );
+
+        assert!(result.is_err());
     }
 }

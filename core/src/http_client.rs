@@ -179,6 +179,22 @@ impl HttpClient {
     }
 
     pub async fn request(&self, req: Request<Bytes>) -> Result<Response<Incoming>, Error> {
+        self.request_checked(req, false).await
+    }
+
+    /// Return a TTS redirect to the caller; never follow it with bearer credentials.
+    pub(crate) async fn request_redirect(
+        &self,
+        req: Request<Bytes>,
+    ) -> Result<Response<Incoming>, Error> {
+        self.request_checked(req, true).await
+    }
+
+    async fn request_checked(
+        &self,
+        req: Request<Bytes>,
+        accept_redirect: bool,
+    ) -> Result<Response<Incoming>, Error> {
         debug!("Requesting {}", req.uri());
 
         // `Request` does not implement `Clone` because its `Body` may be a single-shot stream.
@@ -211,7 +227,10 @@ impl HttpClient {
                     }
                 }
 
-                if !code.is_success() {
+                if !code.is_success()
+                    && !(accept_redirect
+                        && matches!(code, StatusCode::FOUND | StatusCode::SEE_OTHER))
+                {
                     return Err(HttpClientError::StatusCode(code).into());
                 }
             }

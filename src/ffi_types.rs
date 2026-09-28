@@ -71,6 +71,7 @@ pub enum EventType {
     Preloading = 22,
     TimeToPreloadNextTrack = 23,
     PositionChanged = 24,
+    NarrationChanged = 25,
 }
 
 #[repr(C)]
@@ -99,6 +100,7 @@ pub struct EventData {
     pub session_user: *const c_char,
     pub client_name: *const c_char,
     pub log_msg: *const c_char,
+    pub is_narrating: bool,
 }
 
 #[repr(C)]

@@ -77,6 +77,14 @@ impl Deref for AudioPacketPosition {
 pub trait AudioDecoder {
     fn seek(&mut self, position_ms: u32) -> Result<u32, DecoderError>;
     fn next_packet(&mut self) -> DecoderResult<Option<(AudioPacketPosition, AudioPacket)>>;
+    /// Whether the last decoded packet is auxiliary speech, not song progress.
+    fn is_narration(&self) -> bool {
+        false
+    }
+    /// Auxiliary audio has its own loudness, independent of the song or album.
+    fn normalisation_override(&self) -> Option<f64> {
+        None
+    }
 }
 
 impl From<DecoderError> for librespot_core::error::Error {

@@ -76,9 +76,12 @@ impl ResolveContext {
         // otherwise we might not even check if we need to fallback and just use the fallback uri
         match self.resolve {
             Resolve::Uri(ref uri) => ConnectState::valid_resolve_uri(uri),
-            Resolve::Context(ref ctx) => {
-                ConnectState::find_valid_uri(ctx.uri.as_deref(), ctx.pages.first())
-            }
+            Resolve::Context(ref ctx) => ctx
+                .url
+                .as_deref()
+                .filter(|url| url.starts_with("hm://"))
+                .or_else(|| ctx.metadata.get("lexicon_context_url").map(String::as_str))
+                .or_else(|| ConnectState::find_valid_uri(ctx.uri.as_deref(), ctx.pages.first())),
         }
         .or(self.fallback.as_deref())
     }
@@ -214,10 +217,33 @@ impl ContextResolver {
 
         match next.update {
             ContextType::Default => {
+                if let Resolve::Context(context) = &next.resolve {
+                    if resolve_uri.starts_with("hm://lexicon-session-provider/")
+                        && context.pages.iter().any(|page| !page.tracks.is_empty())
+                    {
+                        return Ok(context.clone());
+                    }
+                }
                 let mut ctx = self.session.spclient().get_context(resolve_uri).await;
                 if let Ok(ctx) = ctx.as_mut() {
-                    ctx.uri = Some(next.context_uri().to_string());
-                    ctx.url = ctx.uri.as_ref().map(|s| format!("context://{s}"));
+                    if next.action == ContextAction::Append && resolve_uri.starts_with("hm://") {
+                        if let Some(page) = ctx.pages.first_mut() {
+                            page.page_url = Some(resolve_uri.to_owned());
+                        }
+                    }
+                    if !next.context_uri().starts_with("hm://") {
+                        ctx.uri = Some(next.context_uri().to_string());
+                    }
+                    if ctx.url.as_deref().is_none_or(str::is_empty) {
+                        ctx.url = ctx.uri.as_ref().map(|s| format!("context://{s}"));
+                    }
+                    if let Resolve::Context(original) = &next.resolve {
+                        for (key, value) in &original.metadata {
+                            ctx.metadata
+                                .entry(key.clone())
+                                .or_insert_with(|| value.clone());
+                        }
+                    }
                 }
 
                 ctx
@@ -342,5 +368,26 @@ impl ContextResolver {
         state.update_queue_revision();
 
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transfer_resolves_its_session_instead_of_the_placeholder_playlist() {
+        let resolve = ResolveContext::from_context(Context {
+            uri: Some("spotify:playlist:example".into()),
+            url: Some("hm://lexicon-session-provider/context-resolve/v2/session?contextUri=spotify:playlist:example".into()),
+            ..Default::default()
+        }, ContextType::Default, ContextAction::Replace);
+        assert!(
+            resolve
+                .resolve_uri()
+                .unwrap()
+                .starts_with("hm://lexicon-session-provider/")
+        );
+        assert_eq!(resolve.context_uri(), "spotify:playlist:example");
     }
 }

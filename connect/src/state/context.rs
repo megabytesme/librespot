@@ -15,7 +15,7 @@ use crate::{
     },
 };
 use protobuf::MessageField;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 const LOCAL_FILES_IDENTIFIER: &str = "spotify:local-files";
@@ -28,6 +28,9 @@ pub struct StateContext {
     pub restrictions: Option<Restrictions>,
     /// is used to keep track which tracks are already loaded into the next_tracks
     pub index: ContextIndex,
+    /// Rolling contexts are fetched on demand, independently of autoplay.
+    pub next_page_url: Option<String>,
+    loaded_pages: HashSet<String>,
 }
 
 #[derive(Default, Debug, Copy, Clone, PartialEq, Hash, Eq)]
@@ -50,6 +53,9 @@ pub enum ResetContext<'s> {
 /// Expected `page_url` should look something like the following:
 /// `hm://artistplaycontext/v1/page/spotify/album/5LFzwirfFwBKXJQGfwmiMY/km_artist`
 fn page_url_to_uri(page_url: &str) -> String {
+    if page_url.starts_with("hm://lexicon-session-provider/") {
+        return page_url.to_owned();
+    }
     let split = if let Some(rest) = page_url.strip_prefix("hm://") {
         rest.split('/')
     } else {
@@ -183,6 +189,8 @@ impl ConnectState {
         for (key, value) in metadata {
             player.context_metadata.insert(key, value);
         }
+        // Apply context-specific options before constructing its queue.
+        self.set_shuffle(self.shuffling_context());
     }
 
     pub fn update_context(
@@ -380,6 +388,8 @@ impl ConnectState {
             restrictions,
             metadata,
             index: ContextIndex::new(),
+            next_page_url: page.next_page_url.filter(|url| !url.is_empty()),
+            loaded_pages: page.page_url.into_iter().collect(),
         }
     }
 
@@ -405,9 +415,15 @@ impl ConnectState {
             }
 
             let new_track_uri = new_track.uri.unwrap_or_default();
-            if let Ok(position) =
+            let by_uid = Self::find_index_in_context(current_context, |t| {
+                new_track
+                    .uid
+                    .as_ref()
+                    .is_some_and(|uid| !uid.is_empty() && uid == &t.uid)
+            });
+            if let Ok(position) = by_uid.or_else(|_| {
                 Self::find_index_in_context(current_context, |t| t.uri == new_track_uri)
-            {
+            }) {
                 let context_track = current_context.tracks.get_mut(position)?;
 
                 for (key, value) in new_track.metadata {
@@ -503,6 +519,18 @@ impl ConnectState {
     }
 
     pub fn fill_context_from_page(&mut self, page: ContextPage) -> Result<(), Error> {
+        let page_url = page.page_url.clone();
+        if let Some(url) = &page_url {
+            if self
+                .context
+                .as_ref()
+                .is_some_and(|ctx| ctx.loaded_pages.contains(url))
+            {
+                return Err(Error::failed_precondition(
+                    "context page was already loaded",
+                ));
+            }
+        }
         let ctx_len = self.context.as_ref().map(|c| c.tracks.len());
         let context = self.state_context_from_page(page, HashMap::new(), None, None, ctx_len, None);
 
@@ -511,10 +539,167 @@ impl ConnectState {
             .as_mut()
             .ok_or(StateError::NoContext(ContextType::Default))?;
 
+        ctx.loaded_pages.extend(context.loaded_pages);
+        ctx.next_page_url = context
+            .next_page_url
+            .filter(|url| !ctx.loaded_pages.contains(url));
+
         for t in context.tracks {
             ctx.tracks.push(t)
         }
 
         Ok(())
+    }
+
+    pub fn next_context_page(&self) -> Option<&str> {
+        self.context.as_ref()?.next_page_url.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{Session, SessionConfig};
+    use crate::state::ConnectConfig;
+
+    fn track(number: u8) -> ContextTrack {
+        ContextTrack {
+            uri: Some(
+                SpotifyUri::Track {
+                    id: SpotifyId::from_raw(&[number; 16]).unwrap(),
+                }
+                .to_uri(),
+            ),
+            uid: Some(format!("occurrence-{number}")),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn rolling_pages_preserve_user_queue_and_stop_cursor_cycles() {
+        let session = Session::new(SessionConfig::default(), None);
+        let mut state = ConnectState::new(ConnectConfig::default(), &session);
+        state
+            .update_context(
+                Context {
+                    uri: Some("spotify:playlist:example".into()),
+                    pages: vec![ContextPage {
+                        tracks: vec![track(1), track(2)],
+                        page_url: Some("hm://service/page-1".into()),
+                        next_page_url: Some("hm://service/page-2".into()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                ContextType::Default,
+            )
+            .unwrap();
+        state.set_current_track(0).unwrap();
+        state.reset_playback_to_position(Some(0)).unwrap();
+        state.add_to_queue(
+            ProvidedTrack {
+                uri: track(9).uri.unwrap(),
+                ..Default::default()
+            },
+            true,
+        );
+        let page = ContextPage {
+            tracks: vec![track(3), track(4)],
+            page_url: Some("hm://service/page-2".into()),
+            next_page_url: Some("hm://service/page-1".into()),
+            ..Default::default()
+        };
+        assert_eq!(state.next_context_page(), Some("hm://service/page-2"));
+        state.fill_context_from_page(page.clone()).unwrap();
+        state.fill_up_next_tracks().unwrap();
+        let order: Vec<_> = state
+            .player()
+            .next_tracks
+            .iter()
+            .map(|track| track.uri.clone())
+            .collect();
+        let expected: Vec<_> = [9, 2, 3, 4].map(|number| track(number).uri.unwrap()).into();
+        assert_eq!(order, expected);
+        assert!(state.next_context_page().is_none());
+        assert!(state.fill_context_from_page(page).is_err());
+        assert_eq!(
+            state
+                .get_context(ContextType::Default)
+                .unwrap()
+                .tracks
+                .len(),
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn narration_does_not_make_a_connect_device_look_paused() {
+        let session = Session::new(SessionConfig::default(), None);
+        let mut state = ConnectState::new(ConnectConfig::default(), &session);
+        let status = crate::model::SpircPlayStatus::Playing {
+            nominal_start_time: 0,
+            preloading_of_next_track_triggered: false,
+        };
+        state.narrating = true;
+        state.set_status(&status);
+        assert!(state.player().is_playing);
+        assert!(!state.player().is_paused);
+        assert_eq!(state.player().playback_speed, 0.0);
+        state.narrating = false;
+        state.set_status(&status);
+        assert_eq!(state.player().playback_speed, 1.0);
+    }
+
+    #[tokio::test]
+    async fn transfer_uses_the_narration_for_the_matching_occurrence() {
+        let session = Session::new(SessionConfig::default(), None);
+        let mut state = ConnectState::new(ConnectConfig::default(), &session);
+        let first = track(1);
+        let mut second = first.clone();
+        second.uid = Some("second-occurrence".into());
+        second
+            .metadata
+            .insert("narration.intro.ssml".into(), "second introduction".into());
+        state
+            .update_context(
+                Context {
+                    uri: Some("spotify:playlist:example".into()),
+                    pages: vec![ContextPage {
+                        tracks: vec![first, second.clone()],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                ContextType::Default,
+            )
+            .unwrap();
+        let mut transferred = state
+            .context_to_provided_track(&second, None, None, None, None)
+            .unwrap();
+        transferred.metadata.clear();
+        state.set_track(transferred);
+        state.finish_transfer(Default::default()).unwrap();
+        assert_eq!(state.player().index.track, 1);
+        assert_eq!(
+            state.player().track.metadata["narration.intro.ssml"],
+            "second introduction"
+        );
+        second
+            .metadata
+            .insert("narration.intro.ssml".into(), "updated introduction".into());
+        state.merge_context(Some(ContextPage {
+            tracks: vec![second],
+            ..Default::default()
+        }));
+        let context = state.get_context(ContextType::Default).unwrap();
+        assert!(
+            !context.tracks[0]
+                .metadata
+                .contains_key("narration.intro.ssml")
+        );
+        assert_eq!(
+            context.tracks[1].metadata["narration.intro.ssml"],
+            "updated introduction"
+        );
     }
 }

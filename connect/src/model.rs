@@ -165,3 +165,32 @@ pub(super) enum SpircPlayStatus {
         preloading_of_next_track_triggered: bool,
     },
 }
+
+impl SpircPlayStatus {
+    /// Finish an asynchronous transfer using the current intent, including any
+    /// pause or seek received while its context was resolving.
+    pub fn pending_load(&self) -> Option<(bool, u32)> {
+        match *self {
+            Self::LoadingPlay { position_ms } => Some((true, position_ms)),
+            Self::LoadingPause { position_ms } => Some((false, position_ms)),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SpircPlayStatus;
+
+    #[test]
+    fn pending_transfer_follows_the_latest_pause_and_seek_intent() {
+        let mut status = SpircPlayStatus::LoadingPlay { position_ms: 0 };
+        assert_eq!(status.pending_load(), Some((true, 0)));
+        status = SpircPlayStatus::LoadingPause { position_ms: 5000 };
+        assert_eq!(status.pending_load(), Some((false, 5000)));
+        status = SpircPlayStatus::LoadingPlay { position_ms: 9000 };
+        assert_eq!(status.pending_load(), Some((true, 9000)));
+        status = SpircPlayStatus::Stopped;
+        assert_eq!(status.pending_load(), None);
+    }
+}

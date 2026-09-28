@@ -10,9 +10,14 @@ use protobuf::MessageField;
 
 impl ConnectState {
     pub fn handle_shuffle(&mut self, shuffle: bool) -> Result<(), Error> {
+        // Refused shuffle requests must not rebuild an already ordered DJ
+        // queue (especially while a manually queued song is playing).
+        if self.is_dj() && !self.shuffling_context() {
+            return Ok(());
+        }
         self.set_shuffle(shuffle);
 
-        if shuffle {
+        if self.shuffling_context() {
             return self.shuffle_new();
         }
 

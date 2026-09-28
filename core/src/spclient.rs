@@ -40,6 +40,9 @@ use rand::RngCore;
 use serde::Serialize;
 use thiserror::Error;
 
+mod context;
+mod narration;
+
 component! {
     SpClient : SpClientInner {
         accesspoint: Option<SocketAddress> = None,
@@ -876,23 +879,7 @@ impl SpClient {
     ///   - the query result shown by the search expects no query at all
     ///   - uri looks like `spotify:search:never+gonna`
     pub async fn get_context(&self, uri: &str) -> Result<Context, Error> {
-        let uri = format!("/context-resolve/v1/{uri}");
-
-        let res = self
-            .request_with_options(&Method::GET, &uri, None, None, &NO_METRICS_AND_SALT)
-            .await?;
-        let ctx_json = String::from_utf8(res.to_vec())?;
-        if ctx_json.is_empty() {
-            Err(SpClientError::NoData)?
-        }
-
-        let ctx = protobuf_json_mapping::parse_from_str::<Context>(&ctx_json);
-
-        if ctx.is_err() {
-            trace!("failed parsing context: {ctx_json}")
-        }
-
-        Ok(ctx?)
+        self.resolve_context(uri).await
     }
 
     pub async fn get_autoplay_context(
