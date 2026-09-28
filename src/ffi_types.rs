@@ -76,6 +76,7 @@ pub enum EventType {
     PlaybackAuthorizationRejected = 26,
     PlaybackAccountUnsupported = 27,
     NarrationChanged = 28,
+    DjStateChanged = 29,
 }
 
 #[repr(C)]
@@ -109,6 +110,8 @@ pub struct EventData {
     pub is_narrating: bool,
     pub narration_duration_ms: u32,
     pub narration_text: *const c_char,
+    pub is_dj: bool,
+    pub dj_next_set_uid: *const c_char,
 }
 
 #[repr(C)]

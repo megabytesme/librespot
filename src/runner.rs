@@ -58,6 +58,7 @@ pub enum LibrespotCommand {
     Play,
     Pause,
     Next,
+    DjNextSet(String),
     Prev,
     SetVolume(u16),
     Seek(u32),
@@ -608,6 +609,14 @@ impl Runner {
                                 let _ = s.next().map_err(|e| log::error!("Spirc Next failed: {:?}", e));
                             } else {
                                 log::warn!("Next command ignored: No active Spirc session");
+                            }
+                        }
+                        LibrespotCommand::DjNextSet(uid) => {
+                            if let Some(ref s) = spirc {
+                                let _ = s.activate().map_err(|e| log::warn!("Failed to activate Spirc before Next DJ vibe: {:?}", e));
+                                let _ = s.dj_next_set(uid).map_err(|e| log::error!("Spirc Next DJ vibe failed: {:?}", e));
+                            } else {
+                                log::warn!("Next DJ vibe command ignored: No active Spirc session");
                             }
                         }
                         LibrespotCommand::Prev => {
@@ -1295,10 +1304,26 @@ impl Runner {
                     data,
                 });
             }
-            PlayerEvent::SetQueue { .. }
-            | PlayerEvent::DjStateChanged { .. }
-            | PlayerEvent::DjJumpRejected => {
-                // Queue snapshots and DJ set state are not exposed to the UWP host.
+            PlayerEvent::DjStateChanged {
+                ref context_uri,
+                ref next_set,
+            } => {
+                let next_set_uid = next_set
+                    .as_ref()
+                    .map(|set| CString::new(set.uid.clone()).unwrap_or_default());
+                data.is_dj = context_uri.is_some();
+                if let Some(ref uid) = next_set_uid {
+                    data.dj_next_set_uid = uid.as_ptr();
+                }
+                temp_strings.extend(next_set_uid);
+
+                self.emit(LibrespotEvent {
+                    event_type: EventType::DjStateChanged,
+                    data,
+                });
+            }
+            PlayerEvent::SetQueue { .. } | PlayerEvent::DjJumpRejected => {
+                // Queue snapshots and rejected stale DJ jumps are not exposed to the UWP host.
             }
         }
     }

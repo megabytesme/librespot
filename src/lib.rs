@@ -774,6 +774,23 @@ pub unsafe extern "C" fn librespot_next(instance: *mut LibrespotInstance) {
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn librespot_dj_next_set(
+    instance: *mut LibrespotInstance,
+    expected_uid: *const c_char,
+) {
+    if instance.is_null() || expected_uid.is_null() {
+        return;
+    }
+
+    let expected_uid = unsafe { CStr::from_ptr(expected_uid) }.to_string_lossy();
+    if expected_uid.is_empty() {
+        return;
+    }
+
+    send_cmd(instance, LibrespotCommand::DjNextSet(expected_uid.into_owned()));
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn librespot_prev(instance: *mut LibrespotInstance) {
     send_cmd(instance, LibrespotCommand::Prev);
 }
