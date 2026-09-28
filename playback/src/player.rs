@@ -171,6 +171,12 @@ enum PlayerCommand {
     EmitAddedToQueueEvent(SpotifyUri),
     EmitDjState(Option<String>, Option<DjSet>),
     EmitDjJumpRejected,
+    EmitSetQueueEvent {
+        context_uri: String,
+        current_track: Option<QueueTrack>,
+        next_tracks: Vec<QueueTrack>,
+        prev_tracks: Vec<QueueTrack>,
+    },
 }
 
 /// A server-supplied DJ set boundary.
@@ -180,6 +186,13 @@ pub struct DjSet {
     pub uid: String,
     /// Context rows through the selected song, excluding manually queued songs.
     pub consumed: Vec<String>,
+}
+
+/// Represents a track in the queue with its URI and provider.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueueTrack {
+    pub uri: String,
+    pub provider: String,
 }
 
 #[derive(Debug, Clone)]
@@ -199,9 +212,6 @@ pub enum PlayerEvent {
     // Play request id changed
     PlayRequestIdChanged {
         play_request_id: u64,
-    },
-    AddedToQueue {
-        track_id: SpotifyUri,
     },
     // Fired when the player is stopped (e.g. by issuing a "stop" command to the player).
     Stopped {
@@ -304,6 +314,13 @@ pub enum PlayerEvent {
     },
     FilterExplicitContentChanged {
         filter: bool,
+    },
+    /// Fired when the queue is set or context is loaded with its track list.
+    SetQueue {
+        context_uri: String,
+        current_track: Option<QueueTrack>,
+        next_tracks: Vec<QueueTrack>,
+        prev_tracks: Vec<QueueTrack>,
     },
 }
 
@@ -762,8 +779,19 @@ impl Player {
         self.command(PlayerCommand::EmitAutoPlayChangedEvent(auto_play));
     }
 
-    pub fn emit_added_to_queue_event(&self, track_id: SpotifyUri) {
-        self.command(PlayerCommand::EmitAddedToQueueEvent(track_id));
+    pub fn emit_set_queue_event(
+        &self,
+        context_uri: String,
+        current_track: Option<QueueTrack>,
+        next_tracks: Vec<QueueTrack>,
+        prev_tracks: Vec<QueueTrack>,
+    ) {
+        self.command(PlayerCommand::EmitSetQueueEvent {
+            context_uri,
+            current_track,
+            next_tracks,
+            prev_tracks,
+        });
     }
 }
 
@@ -2654,9 +2682,17 @@ impl PlayerInternal {
                 self.auto_normalise_as_album = setting
             }
 
-            PlayerCommand::EmitAddedToQueueEvent(track_id) => {
-                self.send_event(PlayerEvent::AddedToQueue { track_id })
-            }
+            PlayerCommand::EmitSetQueueEvent {
+                context_uri,
+                current_track,
+                next_tracks,
+                prev_tracks,
+            } => self.send_event(PlayerEvent::SetQueue {
+                context_uri,
+                current_track,
+                next_tracks,
+                prev_tracks,
+            }),
 
             PlayerCommand::EmitFilterExplicitContentChangedEvent(filter) => {
                 self.send_event(PlayerEvent::FilterExplicitContentChanged { filter });
@@ -2917,9 +2953,16 @@ impl fmt::Debug for PlayerCommand {
                 .debug_tuple("EmitAutoPlayChangedEvent")
                 .field(&auto_play)
                 .finish(),
-            PlayerCommand::EmitAddedToQueueEvent(track_id) => f
-                .debug_tuple("EmitAddedToQueueEvent")
-                .field(&track_id)
+            PlayerCommand::EmitSetQueueEvent {
+                context_uri,
+                next_tracks,
+                prev_tracks,
+                ..
+            } => f
+                .debug_tuple("EmitSetQueueEvent")
+                .field(&context_uri)
+                .field(&next_tracks.len())
+                .field(&prev_tracks.len())
                 .finish(),
         }
     }

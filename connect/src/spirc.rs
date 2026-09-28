@@ -15,7 +15,7 @@ use crate::{
     playback::{
         mixer::Mixer,
         narration::Narration,
-        player::{Player, PlayerEvent, PlayerEventChannel},
+        player::{Player, PlayerEvent, PlayerEventChannel, QueueTrack},
     },
     protocol::{
         connect::{Cluster, ClusterUpdate, LogoutCommand, SetVolumeCommand},
@@ -96,6 +96,8 @@ struct SpircTask {
 
     context_resolver: ContextResolver,
 
+    emit_set_queue_events: bool,
+
     shutdown: bool,
     session: Session,
 
@@ -137,6 +139,7 @@ enum SpircCommand {
     Transfer(Option<TransferRequest>),
     Load(LoadRequest),
     AddToQueue(SpotifyUri),
+    ClearQueue,
 }
 
 const CONTEXT_FETCH_THRESHOLD: usize = 2;
@@ -176,6 +179,7 @@ impl Spirc {
         let spirc_id = SPIRC_COUNTER.fetch_add(1, Ordering::AcqRel);
         debug!("new Spirc[{spirc_id}]");
 
+        let emit_set_queue_events = config.emit_set_queue_events;
         let mut connect_state = ConnectState::new(config, &session);
         connect_state.set_dj_support(player.supports_narration());
 
@@ -253,6 +257,8 @@ impl Spirc {
 
             context_resolver: ContextResolver::new(session.clone()),
             pending_dj_transfer: false,
+
+            emit_set_queue_events,
 
             shutdown: false,
             session,
@@ -416,6 +422,17 @@ impl Spirc {
             return Err(Error::invalid_argument("uri"));
         }
         Ok(self.commands.send(SpircCommand::AddToQueue(uri))?)
+    }
+
+    /// Removes all queued tracks from the next tracks.
+    ///
+    /// Does nothing if we are not the active device.
+    ///
+    /// Only tracks added to the queue (via [Spirc::add_to_queue] or a connect client)
+    /// are removed. The current track, even if it was queued, and the tracks of the
+    /// context are kept; the next tracks are filled up from the context again.
+    pub fn clear_queue(&self) -> Result<(), Error> {
+        Ok(self.commands.send(SpircCommand::ClearQueue)?)
     }
 
     /// Disconnects the current device and pauses the playback according the value.
@@ -649,6 +666,11 @@ impl SpircTask {
             false
         };
 
+        // Fire set queue event if context was successfully loaded
+        if update_state {
+            self.emit_set_queue_event();
+        }
+
         self.context_resolver.remove_used_and_invalid();
         if update_state && std::mem::take(&mut self.pending_dj_transfer) {
             if let Some((play, position)) = self.play_status.pending_load() {
@@ -658,6 +680,43 @@ impl SpircTask {
             }
         }
         update_state
+    }
+
+    /// Emit set queue event via PlayerEvent
+    fn emit_set_queue_event(&self) {
+        if !self.emit_set_queue_events {
+            return;
+        }
+
+        let state_player = self.connect_state.player();
+
+        let current_track = state_player.track.as_ref().map(|t| QueueTrack {
+            uri: t.uri.clone(),
+            provider: t.provider.clone(),
+        });
+
+        let next_tracks: Vec<_> = state_player
+            .next_tracks
+            .iter()
+            .map(|t| QueueTrack {
+                uri: t.uri.clone(),
+                provider: t.provider.clone(),
+            })
+            .collect();
+
+        let prev_tracks: Vec<_> = state_player
+            .prev_tracks
+            .iter()
+            .map(|t| QueueTrack {
+                uri: t.uri.clone(),
+                provider: t.provider.clone(),
+            })
+            .collect();
+
+        let context_uri = self.connect_state.context_uri().clone();
+
+        self.player
+            .emit_set_queue_event(context_uri, current_track, next_tracks, prev_tracks);
     }
 
     // todo: is the time_delta still necessary?
@@ -732,6 +791,10 @@ impl SpircTask {
             SpircCommand::SetVolume(volume) => self.set_volume(volume),
             SpircCommand::Load(command) => self.handle_load(command, None, None).await?,
             SpircCommand::AddToQueue(uri) => self.handle_add_to_queue(uri).await,
+            SpircCommand::ClearQueue => {
+                self.connect_state.clear_queue()?;
+                self.emit_set_queue_event();
+            }
         };
 
         self.notify().await
@@ -1131,13 +1194,13 @@ impl SpircTask {
             }
             SetRepeatingTrack(repeat_track) => self.handle_repeat_track(repeat_track.value),
             AddToQueue(add_to_queue) => {
-                let track = add_to_queue.track.clone();
                 self.connect_state.add_to_queue(add_to_queue.track, true);
-                if let Ok(uri) = SpotifyUri::from_uri(&track.uri) {
-                    self.player.emit_added_to_queue_event(uri);
-                }
+                self.emit_set_queue_event();
             }
-            SetQueue(set_queue) => self.connect_state.handle_set_queue(set_queue),
+            SetQueue(set_queue) => {
+                self.connect_state.handle_set_queue(set_queue);
+                self.emit_set_queue_event();
+            }
             SetOptions(set_options) => {
                 if let Some(repeat_context) = set_options.repeating_context {
                     self.handle_repeat_context(repeat_context)?
@@ -1542,6 +1605,8 @@ impl SpircTask {
             .connect_state
             .update_context(ctx, ContextType::Default)?;
 
+        self.emit_set_queue_event();
+
         Ok(())
     }
 
@@ -1683,11 +1748,8 @@ impl SpircTask {
                 ..Default::default()
             };
             self.connect_state.add_to_queue(track, true);
-
-            if let Ok(uri) = SpotifyUri::from_uri(&track_uri) {
-                self.player.emit_added_to_queue_event(uri);
-            }
         }
+        self.emit_set_queue_event();
     }
 
     fn handle_preload_next_track(&mut self) {
