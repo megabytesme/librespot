@@ -296,8 +296,8 @@ mod tests {
     fn windows_x86_platforms_are_unchanged() {
         assert_eq!(
             platform_for("windows", "x86_64"),
-            Platform::PLATFORM_WIN32_X86_64
+            Platform::PLATFORM_WINRT_X86_64
         );
-        assert_eq!(platform_for("windows", "x86"), Platform::PLATFORM_WIN32_X86);
+        assert_eq!(platform_for("windows", "x86"), Platform::PLATFORM_WINRT_X86);
     }
 }

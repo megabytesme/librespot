@@ -1,5 +1,6 @@
 target
-.cargo
+.cargo/*
+!.cargo/config.toml
 spotify_appkey.key
 .idea/
 .vagrant/

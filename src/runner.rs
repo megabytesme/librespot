@@ -8,7 +8,7 @@ use librespot_connect::{
 };
 use librespot_core::{
     FileId, Session, SessionConfig, SpotifyId, SpotifyUri, authentication::Credentials,
-    cache::Cache, config::DeviceType,
+    cache::Cache, config::DeviceType, error::ErrorKind as CoreErrorKind,
 };
 use librespot_discovery::Discovery;
 use librespot_metadata::audio::{AudioFileFormat, AudioItem};
@@ -21,11 +21,11 @@ use librespot_metadata::{
 use librespot_playback::{
     config::{AudioFormat, PlayerConfig},
     mixer::{self, MixerConfig},
-    player::{OfflineTrackMetadata, Player, PlayerEvent},
+    player::{OfflineTrackMetadata, Player, PlayerEvent, PlayerUnavailableReason},
 };
 use librespot_protocol::{
-    autoplay_context_request::AutoplayContextRequest, context::Context,
-    playlist4_external::SelectedListContent,
+    authentication::AuthenticationType, autoplay_context_request::AutoplayContextRequest,
+    context::Context, playlist4_external::SelectedListContent,
 };
 use protobuf::Message;
 use serde::{Deserialize, Serialize};
@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex, atomic::AtomicU8};
 use std::{
@@ -52,6 +52,7 @@ pub enum LibrespotCommand {
     Load {
         context_uri: String,
         start_from_uri: Option<String>,
+        ordered_track_uris: Option<Vec<String>>,
         play: bool,
     },
     Play,
@@ -361,6 +362,8 @@ pub struct RunnerState {
     pub current_track: RwLock<Option<TrackMetadataInternal>>,
     pub sample_rate: AtomicU32,
     pub bytes_per_sample: AtomicU8,
+    pub audio_generation: AtomicU64,
+    pub playback_credentials: RwLock<Option<String>>,
 }
 
 impl RunnerState {
@@ -385,6 +388,8 @@ impl RunnerState {
             current_track: RwLock::new(None),
             sample_rate: AtomicU32::new(sample_rate),
             bytes_per_sample: AtomicU8::new(bytes),
+            audio_generation: AtomicU64::new(0),
+            playback_credentials: RwLock::new(None),
         }
     }
 }
@@ -575,6 +580,7 @@ impl Runner {
         let mut connecting = last_creds.is_some();
         let mut next_connect_attempt = Instant::now();
         let mut connect_backoff = Duration::from_secs(1);
+        let mut account_validation_pending = false;
 
         loop {
             tokio::select! {
@@ -633,7 +639,7 @@ impl Runner {
                                 let _ = s.repeat_track(enabled).map_err(|e| log::error!("Failed to set repeat track: {:?}", e));
                             }
                         }
-                        LibrespotCommand::Load { context_uri, start_from_uri, play } => {
+                        LibrespotCommand::Load { context_uri, start_from_uri, ordered_track_uris, play } => {
                             if let Ok(_ctx_uri) = SpotifyUri::from_uri(&context_uri) {
                                 player.stop();
                                 self.state.position_ms.store(0, Ordering::Release);
@@ -668,7 +674,16 @@ impl Runner {
                                         playing_track: Some(PlayingTrack::Uri(track_to_load)),
                                     };
 
-                                    let request = LoadRequest::from_context_uri(context_uri, options);
+                                    let request = match ordered_track_uris {
+                                        Some(tracks) if !tracks.is_empty() => {
+                                            LoadRequest::from_tracks_with_context_uri(
+                                                tracks,
+                                                context_uri,
+                                                options,
+                                            )
+                                        }
+                                        _ => LoadRequest::from_context_uri(context_uri, options),
+                                    };
                                     if let Err(e) = s.load(request) {
                                         log::error!("Spirc load failed: {:?}", e);
                                     }
@@ -685,6 +700,7 @@ impl Runner {
                             log::info!("Updating credentials: User {}", username);
                             last_creds = Some(Credentials::with_password(username, auth_data));
                             connecting = true;
+                            account_validation_pending = false;
                             if let Some(s) = spirc.take() { let _ = s.shutdown(); }
                             spirc_task = None;
                         }
@@ -761,7 +777,7 @@ impl Runner {
                 }
 
                 Some(event) = player_rx.recv() => {
-                    if let PlayerEvent::TrackChanged { ref audio_item } = event {
+                    if let PlayerEvent::TrackChanged { ref audio_item, .. } = event {
                         let track_uri = audio_item.uri.clone();
                         let lyrics_session = session.clone();
                         let offline_index = self.offline_index.clone();
@@ -812,6 +828,7 @@ impl Runner {
 
                     if let Some(c) = last_creds.clone() {
                         if let Some(s) = spirc.take() { let _ = s.shutdown(); }
+                        session.clear_account_type();
                         let spirc_res = Spirc::new(
                             self.setup.connect_config.clone(),
                             session.clone(),
@@ -822,17 +839,48 @@ impl Runner {
 
                         match spirc_res {
                             Ok((s, task)) => {
+                                let credentials = Credentials {
+                                    username: Some(session.username().to_owned()),
+                                    auth_type: AuthenticationType::AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS,
+                                    auth_data: session.auth_data(),
+                                };
+                                match serde_json::to_string(&credentials) {
+                                    Ok(json) => {
+                                        if let Ok(mut slot) = self.state.playback_credentials.write() {
+                                            *slot = Some(json);
+                                        }
+                                    }
+                                    Err(err) => log::error!(
+                                        "Unable to retain reusable playback credentials: {err}"
+                                    ),
+                                }
                                 spirc = Some(s);
                                 spirc_task = Some(Box::pin(task));
                                 connect_backoff = Duration::from_secs(1);
                                 next_connect_attempt = Instant::now();
+                                let session_user = CString::new(session.username()).unwrap_or_default();
+                                let mut data: EventData = unsafe { std::mem::zeroed() };
+                                data.session_user = session_user.as_ptr();
                                 self.emit(LibrespotEvent {
                                     event_type: EventType::SessionConnected,
-                                    data: unsafe { std::mem::zeroed() }
+                                    data,
                                 });
+                                account_validation_pending = true;
                                 connecting = false;
                             }
                             Err(e) => {
+                                if e.kind == CoreErrorKind::Unauthenticated {
+                                    log::error!(
+                                        "Spotify rejected the playback authorization; waiting for new credentials"
+                                    );
+                                    self.emit(LibrespotEvent {
+                                        event_type: EventType::PlaybackAuthorizationRejected,
+                                        data: unsafe { std::mem::zeroed() }
+                                    });
+                                    connecting = false;
+                                    last_creds = None;
+                                    continue;
+                                }
                                 log::error!(
                                     "Spirc connection failed: {:?}. Retrying in {:?}.",
                                     e,
@@ -848,6 +896,34 @@ impl Runner {
                     }
                 }
 
+                _ = sleep(Duration::from_millis(100)), if account_validation_pending => {
+                    if let Some(account_type) = session.get_user_attribute("type") {
+                        account_validation_pending = false;
+                        if account_type != "premium" {
+                            log::error!(
+                                "Spotify playback account type {:?} is unsupported; disconnecting without terminating the host process",
+                                account_type
+                            );
+                            player.stop();
+                            if let Some(s) = spirc.take() {
+                                let _ = s.shutdown();
+                            }
+                            spirc_task = None;
+                            connecting = false;
+                            last_creds = None;
+                            session.shutdown();
+                            self.emit(LibrespotEvent {
+                                event_type: EventType::PlaybackAccountUnsupported,
+                                data: unsafe { std::mem::zeroed() },
+                            });
+                            self.emit(LibrespotEvent {
+                                event_type: EventType::SessionDisconnected,
+                                data: unsafe { std::mem::zeroed() },
+                            });
+                        }
+                    }
+                }
+
                 _ = async {
                     if let Some(t) = spirc_task.as_mut() { t.await; }
                 }, if spirc_task.is_some() => {
@@ -857,6 +933,20 @@ impl Runner {
                         event_type: EventType::SessionDisconnected,
                         data: unsafe { std::mem::zeroed() }
                     });
+
+                    if last_creds.is_some() {
+                        let retry_delay = connect_backoff;
+                        connecting = true;
+                        next_connect_attempt = Instant::now() + retry_delay;
+                        connect_backoff = std::cmp::min(
+                            connect_backoff.saturating_mul(2),
+                            Duration::from_secs(30),
+                        );
+                        log::warn!(
+                            "Spirc task ended unexpectedly. Reconnecting in {:?}.",
+                            retry_delay
+                        );
+                    }
                 }
             }
         }
@@ -877,6 +967,17 @@ impl Runner {
     fn handle_player_event(&self, event: PlayerEvent) {
         let mut data: EventData = unsafe { std::mem::zeroed() };
         let mut temp_strings: Vec<CString> = Vec::new();
+        let event_audio_generation = match &event {
+            PlayerEvent::Seeked {
+                audio_generation, ..
+            }
+            | PlayerEvent::TrackChanged {
+                audio_generation, ..
+            } => Some(*audio_generation),
+            _ => None,
+        };
+        data.audio_generation = event_audio_generation
+            .unwrap_or_else(|| self.state.audio_generation.load(Ordering::Acquire));
 
         match event {
             PlayerEvent::Playing {
@@ -898,6 +999,7 @@ impl Runner {
                 play_request_id,
                 ref track_id,
                 position_ms,
+                ..
             }
             | PlayerEvent::PositionCorrection {
                 play_request_id,
@@ -920,6 +1022,13 @@ impl Runner {
                 data.play_request_id = play_request_id;
                 data.position_ms = position_ms;
 
+                if let Some(audio_generation) = event_audio_generation {
+                    data.audio_generation = audio_generation;
+                    self.state
+                        .audio_generation
+                        .store(audio_generation, Ordering::Release);
+                }
+
                 let event_type = match event {
                     PlayerEvent::Playing { .. } => {
                         self.state.is_playing.store(true, Ordering::Release);
@@ -940,7 +1049,12 @@ impl Runner {
                 self.emit(LibrespotEvent { event_type, data });
             }
 
-            PlayerEvent::TrackChanged { audio_item } => {
+            PlayerEvent::TrackChanged {
+                audio_item,
+                play_request_id,
+                audio_generation,
+                was_preloaded,
+            } => {
                 let duration = audio_item.duration_ms as u32;
                 self.state.duration_ms.store(duration, Ordering::Relaxed);
                 self.state.position_ms.store(0, Ordering::Release);
@@ -948,6 +1062,9 @@ impl Runner {
                     librespot_playback::audio_backend::get_write_pos(),
                     Ordering::Release,
                 );
+                self.state
+                    .audio_generation
+                    .store(audio_generation, Ordering::Release);
 
                 let artist_name = match &audio_item.unique_fields {
                     librespot_metadata::audio::UniqueFields::Track { artists, .. } => artists
@@ -991,6 +1108,9 @@ impl Runner {
 
                 data.duration_ms = duration;
                 data.track = ManuallyDrop::new(meta);
+                data.play_request_id = play_request_id;
+                data.audio_generation = audio_generation;
+                data.was_preloaded = was_preloaded;
 
                 self.emit(LibrespotEvent {
                     event_type: EventType::TrackChanged,
@@ -1117,6 +1237,7 @@ impl Runner {
             | PlayerEvent::Unavailable {
                 play_request_id,
                 ref track_id,
+                ..
             } => {
                 let uri = CString::new(track_id.to_string()).unwrap_or_default();
                 data.track_uri = uri.as_ptr();
@@ -1130,6 +1251,14 @@ impl Runner {
                         EventType::PlaybackStopped
                     }
                     PlayerEvent::EndOfTrack { .. } => EventType::EndOfTrack,
+                    PlayerEvent::Unavailable {
+                        reason: PlayerUnavailableReason::AudioKey,
+                        ..
+                    } => {
+                        self.state.is_playing.store(false, Ordering::Release);
+                        data.is_playing = false;
+                        EventType::PlaybackKeyUnavailable
+                    }
                     _ => EventType::PlaybackUnavailable,
                 };
 

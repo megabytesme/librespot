@@ -32,6 +32,14 @@ pub trait Open {
 }
 
 pub trait Sink {
+    /// Marks the first byte position of a new decoded PCM generation.
+    ///
+    /// Backends which expose buffered PCM to another consumer can override this
+    /// to prevent samples from different loads/seeks being treated as one
+    /// unmarked stream. Other backends do not need generation tracking.
+    fn begin_generation(&mut self) -> u64 {
+        0
+    }
     fn start(&mut self) -> SinkResult<()> {
         Ok(())
     }

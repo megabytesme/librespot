@@ -10,7 +10,7 @@ use std::{
     sync::Mutex,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
     thread,
@@ -32,8 +32,7 @@ use crate::{
     narration::Narration,
 };
 use futures_util::{
-    StreamExt, TryFutureExt, future, future::FusedFuture,
-    stream::futures_unordered::FuturesUnordered,
+    FutureExt, StreamExt, future, future::FusedFuture, stream::futures_unordered::FuturesUnordered,
 };
 use librespot_metadata::{
     artist::{ArtistRole, ArtistWithRole, ArtistsWithRole},
@@ -57,6 +56,10 @@ pub const PCM_AT_0DBFS: f64 = 1.0;
 const SPOTIFY_OGG_HEADER_END: u64 = 0xa7;
 
 const LOAD_HANDLES_POISON_MSG: &str = "load handles mutex should not be poisoned";
+
+fn requires_audio_key(uri: &str) -> bool {
+    uri.starts_with("spotify:track:")
+}
 
 pub type PlayerResult = Result<(), Error>;
 
@@ -196,6 +199,12 @@ pub struct QueueTrack {
 }
 
 #[derive(Debug, Clone)]
+pub enum PlayerUnavailableReason {
+    Track,
+    AudioKey,
+}
+
+#[derive(Debug, Clone)]
 pub enum PlayerEvent {
     DjStateChanged {
         context_uri: Option<String>,
@@ -262,6 +271,7 @@ pub enum PlayerEvent {
     Unavailable {
         play_request_id: u64,
         track_id: SpotifyUri,
+        reason: PlayerUnavailableReason,
     },
     // The mixer volume was set to a new level.
     VolumeChanged {
@@ -284,9 +294,13 @@ pub enum PlayerEvent {
         play_request_id: u64,
         track_id: SpotifyUri,
         position_ms: u32,
+        audio_generation: u64,
     },
     TrackChanged {
         audio_item: Box<AudioItem>,
+        play_request_id: u64,
+        audio_generation: u64,
+        was_preloaded: bool,
     },
     SessionConnected {
         connection_id: String,
@@ -356,6 +370,9 @@ impl PlayerEvent {
                 play_request_id, ..
             }
             | Seeked {
+                play_request_id, ..
+            }
+            | TrackChanged {
                 play_request_id, ..
             } => Some(*play_request_id),
             _ => None,
@@ -822,7 +839,12 @@ enum PlayerPreload {
     None,
     Loading {
         track_id: SpotifyUri,
-        loader: Pin<Box<dyn FusedFuture<Output = Result<PlayerLoadedTrackData, ()>> + Send>>,
+        loader: Pin<
+            Box<
+                dyn FusedFuture<Output = Result<PlayerLoadedTrackData, PlayerUnavailableReason>>
+                    + Send,
+            >,
+        >,
     },
     Ready {
         track_id: SpotifyUri,
@@ -832,13 +854,53 @@ enum PlayerPreload {
 
 type Decoder = Box<dyn AudioDecoder + Send>;
 
+const POSITION_CORRECTION_TOLERANCE_MS: u32 = 1000;
+
+/// Tracks an authoritative media position plus a monotonic timestamp. Keeping
+/// these as a pair avoids subtracting an arbitrary (and possibly larger) track
+/// position from Instant's opaque epoch, which can fail on short-uptime UWP
+/// devices and previously caused one PositionCorrection event per packet.
+struct PlaybackPositionClock {
+    anchor_position_ms: u32,
+    anchor_instant: Instant,
+}
+
+impl PlaybackPositionClock {
+    fn new(position_ms: u32) -> Self {
+        Self {
+            anchor_position_ms: position_ms,
+            anchor_instant: Instant::now(),
+        }
+    }
+
+    fn reset(&mut self, position_ms: u32, now: Instant) {
+        self.anchor_position_ms = position_ms;
+        self.anchor_instant = now;
+    }
+
+    fn is_behind_tolerance(&self, position_ms: u32, now: Instant) -> bool {
+        let elapsed_ms = now
+            .saturating_duration_since(self.anchor_instant)
+            .as_millis()
+            .min(u32::MAX as u128) as u32;
+        let expected_position_ms = self.anchor_position_ms.saturating_add(elapsed_ms);
+
+        expected_position_ms.saturating_sub(position_ms) >= POSITION_CORRECTION_TOLERANCE_MS
+    }
+}
+
 enum PlayerState {
     Stopped,
     Loading {
         track_id: SpotifyUri,
         play_request_id: u64,
         start_playback: bool,
-        loader: Pin<Box<dyn FusedFuture<Output = Result<PlayerLoadedTrackData, ()>> + Send>>,
+        loader: Pin<
+            Box<
+                dyn FusedFuture<Output = Result<PlayerLoadedTrackData, PlayerUnavailableReason>>
+                    + Send,
+            >,
+        >,
     },
     Paused {
         track_id: SpotifyUri,
@@ -865,7 +927,7 @@ enum PlayerState {
         bytes_per_second: usize,
         duration_ms: u32,
         stream_position_ms: u32,
-        reported_nominal_start_time: Option<Instant>,
+        reported_position: PlaybackPositionClock,
         suggested_to_preload_next_track: bool,
         is_explicit: bool,
     },
@@ -987,8 +1049,7 @@ impl PlayerState {
                     duration_ms,
                     bytes_per_second,
                     stream_position_ms,
-                    reported_nominal_start_time: Instant::now()
-                        .checked_sub(Duration::from_millis(stream_position_ms as u64)),
+                    reported_position: PlaybackPositionClock::new(stream_position_ms),
                     suggested_to_preload_next_track,
                     is_explicit,
                 };
@@ -1046,6 +1107,7 @@ struct PlayerTrackLoader {
     session: Session,
     config: PlayerConfig,
     local_file_lookup: Arc<LocalFileLookup>,
+    audio_key_failed: Arc<AtomicBool>,
 }
 
 impl PlayerTrackLoader {
@@ -1316,13 +1378,21 @@ impl PlayerTrackLoader {
             let is_cached = encrypted_file.is_cached();
             let stream_loader_controller = encrypted_file.get_stream_loader_controller().ok()?;
 
-            // Not all audio files are encrypted. If we can't get a key, try loading the track
-            // without decryption. If the file was encrypted after all, the decoder will fail
-            // parsing and bail out, so we should be safe from outputting ear-piercing noise.
+            // Podcast episodes may be unencrypted. Music tracks are encrypted, so passing their
+            // bytes to a decoder without a key only produces a long stream of invalid headers.
             let key = match self.session.audio_key().request(track_id, file_id).await {
                 Ok(key) => Some(key),
                 Err(e) => {
-                    warn!("Unable to load key, continuing without decryption: {e}");
+                    if requires_audio_key(&audio_item.uri) {
+                        self.audio_key_failed.store(true, Ordering::Release);
+                        error!(
+                            "Unable to load required audio key for <{}>: {e}",
+                            audio_item.uri
+                        );
+                        return None;
+                    }
+
+                    warn!("Unable to load optional episode key, trying without decryption: {e}");
                     None
                 }
             };
@@ -1613,19 +1683,19 @@ impl Future for PlayerInternal {
                                 play_request_id,
                                 loaded_track,
                                 start_playback,
+                                false,
                             );
                             if let PlayerState::Loading { .. } = self.state {
                                 error!("The state wasn't changed by start_playback()");
                                 exit(1);
                             }
                         }
-                        Poll::Ready(Err(e)) => {
-                            error!(
-                                "Skipping to next track, unable to load track <{track_id:?}>: {e:?}"
-                            );
+                        Poll::Ready(Err(reason)) => {
+                            error!("Unable to load track <{track_id:?}>: {reason:?}");
                             self.send_event(PlayerEvent::Unavailable {
                                 track_id,
                                 play_request_id,
+                                reason,
                             })
                         }
                         Poll::Pending => (),
@@ -1650,21 +1720,25 @@ impl Future for PlayerInternal {
                             loaded_track: Box::new(loaded_track),
                         };
                     }
-                    Poll::Ready(Err(_)) => {
-                        debug!("Unable to preload {track_id:?}");
+                    Poll::Ready(Err(reason)) => {
+                        debug!("Unable to preload {track_id:?}: {reason:?}");
                         self.preload = PlayerPreload::None;
-                        // Let Spirc know that the track was unavailable.
-                        if let PlayerState::Playing {
-                            play_request_id, ..
-                        }
-                        | PlayerState::Paused {
-                            play_request_id, ..
-                        } = self.state
-                        {
-                            self.send_event(PlayerEvent::Unavailable {
-                                track_id,
-                                play_request_id,
-                            });
+                        // A rejected key for the next track must not interrupt the current track.
+                        // The key error will be surfaced if that track is actually loaded.
+                        if !matches!(reason, PlayerUnavailableReason::AudioKey) {
+                            if let PlayerState::Playing {
+                                play_request_id, ..
+                            }
+                            | PlayerState::Paused {
+                                play_request_id, ..
+                            } = self.state
+                            {
+                                self.send_event(PlayerEvent::Unavailable {
+                                    track_id,
+                                    play_request_id,
+                                    reason,
+                                });
+                            }
                         }
                     }
                     Poll::Pending => (),
@@ -1681,7 +1755,7 @@ impl Future for PlayerInternal {
                     ref mut decoder,
                     normalisation_factor,
                     ref mut stream_position_ms,
-                    ref mut reported_nominal_start_time,
+                    ref mut reported_position,
                     ..
                 } = self.state
                 {
@@ -1717,52 +1791,24 @@ impl Future for PlayerInternal {
                                 if !passthrough {
                                     match packet.samples() {
                                         Ok(_) => {
-                                            let new_stream_position = Duration::from_millis(
-                                                new_stream_position_ms as u64,
-                                            );
-
                                             let now = Instant::now();
 
                                             // Only notify if we're skipped some packets *or* we are behind.
                                             // If we're ahead it's probably due to a buffer of the backend
                                             // and we're actually in time.
-                                            let notify_about_position =
-                                                match *reported_nominal_start_time {
-                                                    None => true,
-                                                    Some(reported_nominal_start_time) => {
-                                                        let mut notify = false;
-
-                                                        if packet_position.skipped {
-                                                            if let Some(ahead) = new_stream_position
-                                                                .checked_sub(Duration::from_millis(
-                                                                    expected_position_ms as u64,
-                                                                ))
-                                                            {
-                                                                notify |=
-                                                                    ahead >= Duration::from_secs(1)
-                                                            }
-                                                        }
-
-                                                        if let Some(lag) = now
-                                                            .checked_duration_since(
-                                                                reported_nominal_start_time,
-                                                            )
-                                                        {
-                                                            if let Some(lag) =
-                                                                lag.checked_sub(new_stream_position)
-                                                            {
-                                                                notify |=
-                                                                    lag >= Duration::from_secs(1)
-                                                            }
-                                                        }
-
-                                                        notify
-                                                    }
-                                                };
+                                            let skipped_ahead = packet_position.skipped
+                                                && new_stream_position_ms
+                                                    .saturating_sub(expected_position_ms)
+                                                    >= POSITION_CORRECTION_TOLERANCE_MS;
+                                            let notify_about_position = skipped_ahead
+                                                || reported_position.is_behind_tolerance(
+                                                    new_stream_position_ms,
+                                                    now,
+                                                );
 
                                             if notify_about_position {
-                                                *reported_nominal_start_time =
-                                                    now.checked_sub(new_stream_position);
+                                                reported_position
+                                                    .reset(new_stream_position_ms, now);
                                                 self.send_event(PlayerEvent::PositionCorrection {
                                                     play_request_id,
                                                     track_id: track_id.clone(),
@@ -2144,11 +2190,18 @@ impl PlayerInternal {
         play_request_id: u64,
         loaded_track: PlayerLoadedTrackData,
         start_playback: bool,
+        was_preloaded: bool,
     ) {
         self.narrating = false;
         let audio_item = Box::new(loaded_track.audio_item.clone());
+        let audio_generation = self.sink.begin_generation();
 
-        self.send_event(PlayerEvent::TrackChanged { audio_item });
+        self.send_event(PlayerEvent::TrackChanged {
+            audio_item,
+            play_request_id,
+            audio_generation,
+            was_preloaded,
+        });
 
         let position_ms = loaded_track.stream_position_ms;
 
@@ -2182,8 +2235,7 @@ impl PlayerInternal {
                 duration_ms: loaded_track.duration_ms,
                 bytes_per_second: loaded_track.bytes_per_second,
                 stream_position_ms: loaded_track.stream_position_ms,
-                reported_nominal_start_time: Instant::now()
-                    .checked_sub(Duration::from_millis(position_ms as u64)),
+                reported_position: PlaybackPositionClock::new(position_ms),
                 suggested_to_preload_next_track: false,
                 is_explicit: loaded_track.is_explicit,
             };
@@ -2265,7 +2317,7 @@ impl PlayerInternal {
                     loaded_track.stream_position_ms = loaded_track.decoder.seek(position_ms)?;
                 }
                 self.preload = PlayerPreload::None;
-                self.start_playback(track_id, play_request_id, loaded_track, play);
+                self.start_playback(track_id, play_request_id, loaded_track, play, false);
                 if let PlayerState::Invalid = self.state {
                     return Err(Error::internal(format!(
                         "PlayerInternal::handle_command_load repeating the same track: start_playback() did not transition to valid player state: {:?}",
@@ -2336,7 +2388,7 @@ impl PlayerInternal {
                     };
 
                     self.preload = PlayerPreload::None;
-                    self.start_playback(track_id, play_request_id, loaded_track, play);
+                    self.start_playback(track_id, play_request_id, loaded_track, play, false);
 
                     if let PlayerState::Invalid = self.state {
                         return Err(Error::internal(format!(
@@ -2372,7 +2424,7 @@ impl PlayerInternal {
                         // This may be blocking
                         loaded_track.stream_position_ms = loaded_track.decoder.seek(position_ms)?;
                     }
-                    self.start_playback(track_id, play_request_id, *loaded_track, play);
+                    self.start_playback(track_id, play_request_id, *loaded_track, play, true);
                     return Ok(());
                 } else {
                     return Err(Error::internal(format!(
@@ -2536,6 +2588,7 @@ impl PlayerInternal {
             );
         }
 
+        let mut seek_event = None;
         if let Some(decoder) = self.state.decoder() {
             match decoder.seek(position_ms) {
                 Ok(new_position_ms) => {
@@ -2553,12 +2606,7 @@ impl PlayerInternal {
                     } = self.state
                     {
                         *stream_position_ms = new_position_ms;
-
-                        self.send_event(PlayerEvent::Seeked {
-                            play_request_id,
-                            track_id: track_id.clone(),
-                            position_ms: new_position_ms,
-                        });
+                        seek_event = Some((play_request_id, track_id.clone(), new_position_ms));
                     }
                 }
                 Err(e) => error!("PlayerInternal::handle_command_seek error: {e}"),
@@ -2567,17 +2615,26 @@ impl PlayerInternal {
             error!("Player::seek called from invalid state: {:?}", self.state);
         }
 
+        if let Some((play_request_id, track_id, new_position_ms)) = seek_event {
+            if let PlayerState::Playing {
+                ref mut reported_position,
+                ..
+            } = self.state
+            {
+                reported_position.reset(new_position_ms, Instant::now());
+            }
+
+            let audio_generation = self.sink.begin_generation();
+            self.send_event(PlayerEvent::Seeked {
+                play_request_id,
+                track_id,
+                position_ms: new_position_ms,
+                audio_generation,
+            });
+        }
+
         // ensure we have a bit of a buffer of downloaded data
         self.preload_data_before_playback()?;
-
-        if let PlayerState::Playing {
-            ref mut reported_nominal_start_time,
-            ..
-        } = self.state
-        {
-            *reported_nominal_start_time =
-                Instant::now().checked_sub(Duration::from_millis(position_ms as u64));
-        }
 
         Ok(())
     }
@@ -2740,17 +2797,19 @@ impl PlayerInternal {
         spotify_uri: SpotifyUri,
         position_ms: u32,
         narration: Narration,
-    ) -> impl FusedFuture<Output = Result<PlayerLoadedTrackData, ()>> + Send + 'static {
+    ) -> impl FusedFuture<Output = Result<PlayerLoadedTrackData, PlayerUnavailableReason>> + Send + 'static {
         // This method creates a future that returns the loaded stream and associated info.
         // Ideally all work should be done using asynchronous code. However, seek() on the
         // audio stream is implemented in a blocking fashion. Thus, we can't turn it into future
         // easily. Instead we spawn a thread to do the work and return a one-shot channel as the
         // future to work with.
 
+        let audio_key_failed = Arc::new(AtomicBool::new(false));
         let loader = PlayerTrackLoader {
             session: self.session.clone(),
             config: self.config.clone(),
             local_file_lookup: self.local_file_lookup.clone(),
+            audio_key_failed: audio_key_failed.clone(),
         };
 
         let (result_tx, result_rx) = oneshot::channel();
@@ -2760,9 +2819,12 @@ impl PlayerInternal {
 
         let load_handle = thread::spawn(move || {
             let data = handle.block_on(loader.load_track(spotify_uri, position_ms, narration));
-            if let Some(data) = data {
-                let _ = result_tx.send(data);
-            }
+            let reason = if audio_key_failed.load(Ordering::Acquire) {
+                PlayerUnavailableReason::AudioKey
+            } else {
+                PlayerUnavailableReason::Track
+            };
+            let _ = result_tx.send(data.ok_or(reason));
 
             let mut load_handles = load_handles_clone.lock().expect(LOAD_HANDLES_POISON_MSG);
             load_handles.remove(&thread::current().id());
@@ -2771,7 +2833,12 @@ impl PlayerInternal {
         let mut load_handles = self.load_handles.lock().expect(LOAD_HANDLES_POISON_MSG);
         load_handles.insert(load_handle.thread().id(), load_handle);
 
-        result_rx.map_err(|_| ())
+        async move {
+            result_rx
+                .await
+                .unwrap_or(Err(PlayerUnavailableReason::Track))
+        }
+        .fuse()
     }
 
     fn load_offline_track(
@@ -2781,11 +2848,14 @@ impl PlayerInternal {
         format: AudioFileFormat,
         metadata: OfflineTrackMetadata,
         position_ms: u32,
-    ) -> impl FusedFuture<Output = Result<PlayerLoadedTrackData, ()>> + Send + 'static {
+    ) -> impl FusedFuture<Output = Result<PlayerLoadedTrackData, PlayerUnavailableReason>> + Send + 'static
+    {
+        let audio_key_failed = Arc::new(AtomicBool::new(false));
         let loader = PlayerTrackLoader {
             session: self.session.clone(),
             config: self.config.clone(),
             local_file_lookup: self.local_file_lookup.clone(),
+            audio_key_failed: audio_key_failed.clone(),
         };
 
         let (result_tx, result_rx) = oneshot::channel();
@@ -2800,9 +2870,12 @@ impl PlayerInternal {
                 metadata,
                 position_ms,
             ));
-            if let Some(data) = data {
-                let _ = result_tx.send(data);
-            }
+            let reason = if audio_key_failed.load(Ordering::Acquire) {
+                PlayerUnavailableReason::AudioKey
+            } else {
+                PlayerUnavailableReason::Track
+            };
+            let _ = result_tx.send(data.ok_or(reason));
 
             let mut load_handles = load_handles_clone.lock().expect(LOAD_HANDLES_POISON_MSG);
             load_handles.remove(&thread::current().id());
@@ -2811,7 +2884,12 @@ impl PlayerInternal {
         let mut load_handles = self.load_handles.lock().expect(LOAD_HANDLES_POISON_MSG);
         load_handles.insert(load_handle.thread().id(), load_handle);
 
-        result_rx.map_err(|_| ())
+        async move {
+            result_rx
+                .await
+                .unwrap_or(Err(PlayerUnavailableReason::Track))
+        }
+        .fuse()
     }
 
     fn preload_data_before_playback(&mut self) -> PlayerResult {
@@ -3070,5 +3148,39 @@ where
 
     fn byte_len(&self) -> Option<u64> {
         Some(self.length)
+    }
+}
+
+#[cfg(test)]
+mod position_clock_tests {
+    use super::*;
+
+    #[test]
+    fn forward_seek_does_not_depend_on_instant_epoch() {
+        let mut clock = PlaybackPositionClock::new(84_374);
+        let anchor = clock.anchor_instant;
+
+        assert!(!clock.is_behind_tolerance(84_374, anchor));
+        assert!(!clock.is_behind_tolerance(84_873, anchor + Duration::from_millis(500)));
+
+        clock.reset(93_631, anchor + Duration::from_secs(10));
+        assert!(!clock.is_behind_tolerance(93_881, anchor + Duration::from_millis(10_250)));
+    }
+
+    #[test]
+    fn correction_requires_documented_one_second_drift() {
+        let clock = PlaybackPositionClock::new(10_000);
+        let anchor = clock.anchor_instant;
+
+        assert!(!clock.is_behind_tolerance(10_001, anchor + Duration::from_millis(999)));
+        assert!(clock.is_behind_tolerance(10_000, anchor + Duration::from_millis(1000)));
+    }
+
+    #[test]
+    fn music_requires_a_key_but_episodes_can_try_unencrypted_audio() {
+        assert!(requires_audio_key("spotify:track:0000000000000000000000"));
+        assert!(!requires_audio_key(
+            "spotify:episode:0000000000000000000000"
+        ));
     }
 }

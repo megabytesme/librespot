@@ -20,6 +20,7 @@ pub struct LibrespotConfig {
     pub password: *const c_char,
     pub auth_blob: *const c_char,
     pub access_token: *const c_char,
+    pub playback_credentials: *const c_char,
     pub key_callback: Option<LibrespotKeyCallback>,
     pub key_save_callback: Option<LibrespotKeySaveCallback>,
     pub key_remove_callback: Option<LibrespotKeyRemoveCallback>,
@@ -71,7 +72,10 @@ pub enum EventType {
     Preloading = 22,
     TimeToPreloadNextTrack = 23,
     PositionChanged = 24,
-    NarrationChanged = 25,
+    PlaybackKeyUnavailable = 25,
+    PlaybackAuthorizationRejected = 26,
+    PlaybackAccountUnsupported = 27,
+    NarrationChanged = 28,
 }
 
 #[repr(C)]
@@ -100,6 +104,8 @@ pub struct EventData {
     pub session_user: *const c_char,
     pub client_name: *const c_char,
     pub log_msg: *const c_char,
+    pub audio_generation: u64,
+    pub was_preloaded: bool,
     pub is_narrating: bool,
 }
 
